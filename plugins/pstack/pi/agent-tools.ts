@@ -10,7 +10,7 @@ import { isForegroundWait } from "./sleep-wait.ts";
 // Claude Code's Agent tool lists every agent type, the user's included, with its description.
 const typeLine = ([type, { description }]: [string, AgentDefinition]) => `- ${type === GENERAL_PURPOSE ? `${type} (default)` : type}${description ? `: ${description}` : ""}`;
 
-const agentParams = (types: Map<string, AgentDefinition>) => Type.Object(
+export const agentParams = (types: Map<string, AgentDefinition>) => Type.Object(
   {
     description: Type.String({ description: "A short (3-5 word) description of the task" }),
     prompt: Type.String({ description: "The task for the agent to perform" }),

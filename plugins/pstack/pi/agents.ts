@@ -199,7 +199,7 @@ const now = () => new Date().toISOString();
 
 // A value the call left out came from the agent file, which the caller never
 // saw, so an error over the value names that file.
-function fromAgentFile<T>(file: string | undefined, passed: string | undefined, resolve: () => T): T {
+export function fromAgentFile<T>(file: string | undefined, passed: string | undefined, resolve: () => T): T {
   try {
     return resolve();
   } catch (e) {

@@ -26,14 +26,15 @@ const PARALLEL_CALLS =
 // on every agent start so compaction cannot drop them.
 // A child gets the sheet, as a Claude Code subagent sees CLAUDE.md, but not
 // the mandate: SessionStart does not run for subagents.
-export function registerPromptSections(pi: ExtensionAPI, settings: Settings): void {
+export function registerPromptSections(pi: ExtensionAPI, settings: Settings, isBbChild?: () => Promise<boolean>): void {
   const mandateFile = join(settings.pluginRoot, "hooks", "session-start-context.md");
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event) => {
     const sheet = readSheet(settings.agentDir);
     const sections = event.systemPromptOptions.sections;
     sections[PARALLEL_SECTION] = PARALLEL_CALLS;
     sections[TOOLS_SECTION] = piToolsNote(settings.pluginRoot);
-    if (settings.depth === 0 && !sheet?.hookOff) sections[MANDATE_SECTION] = readFileSync(mandateFile, "utf8");
+    const child = settings.depth > 0 || (await isBbChild?.());
+    if (!child && !sheet?.hookOff) sections[MANDATE_SECTION] = readFileSync(mandateFile, "utf8");
     if (sheet) sections[SHEET_SECTION] = sheet.text;
   });
 }

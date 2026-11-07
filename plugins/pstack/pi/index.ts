@@ -3,6 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAgentTools } from "./agent-tools.ts";
 import { AgentRunner } from "./agents.ts";
 import { registerAsk } from "./ask.ts";
+import { BbAgents, registerBbAgentTools } from "./bb.ts";
 import { DEPTH_FLAG, defaultSettings, readSheet, type Settings } from "./config.ts";
 import { registerOneShot } from "./one-shot.ts";
 import { registerPathSkills } from "./path-skills.ts";
@@ -14,10 +15,14 @@ export function install(pi: ExtensionAPI, settings: Settings): void {
   const scheduler = new Scheduler();
   const oneShot = registerOneShot(pi, settings, runner);
   const sheet = readSheet(settings.agentDir);
-  if (!sheet?.agentToolsOff) registerAgentTools(pi, runner, settings);
+  const bb = settings.bb && !sheet?.bbAgentsOff ? new BbAgents(pi, settings, settings.bb) : undefined;
+  if (!sheet?.agentToolsOff) {
+    if (bb) registerBbAgentTools(pi, bb, settings);
+    else registerAgentTools(pi, runner, settings);
+  }
   if (!sheet?.askToolOff) registerAsk(pi, oneShot);
   registerSchedule(pi, scheduler, oneShot);
-  registerPromptSections(pi, settings);
+  registerPromptSections(pi, settings, bb ? () => bb.isChild() : undefined);
   registerPathSkills(pi, settings);
   // Children run detached, in their own process group, so a parent that exits
   // without session_shutdown would leave them running: this exit hook signals

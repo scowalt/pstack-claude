@@ -18,6 +18,20 @@ export const PSTACK_STATE_DIR = "pstack";
 // own frontmatter.
 export const USER_AGENTS_DIR = "pstack-agents";
 
+export interface BbEnv {
+  cli: string;
+  projectId: string;
+  threadId: string;
+  environmentId: string;
+}
+
+// bb sets these in every thread's environment, a pi thread's included.
+function bbEnv(): BbEnv | undefined {
+  const { BB_CLI, BB_THREAD_ID, BB_PROJECT_ID, BB_ENVIRONMENT_ID } = process.env;
+  if (!BB_THREAD_ID || !BB_PROJECT_ID || !BB_ENVIRONMENT_ID) return undefined;
+  return { cli: BB_CLI || "bb", projectId: BB_PROJECT_ID, threadId: BB_THREAD_ID, environmentId: BB_ENVIRONMENT_ID };
+}
+
 export interface Settings {
   pluginRoot: string;
   modelsFile: string;
@@ -29,6 +43,8 @@ export interface Settings {
   // How long a settled child gets to exit after its stdin closes. It covers a
   // nested child's own shutdown, which stops its agents with killGraceMs each.
   exitGraceMs: number;
+  // Set when pi runs as a bb thread: the agent tools then start bb child threads.
+  bb?: BbEnv;
 }
 
 // Pi re-runs itself for children when it can: the same runtime and CLI script,
@@ -56,6 +72,7 @@ export function defaultSettings(readDepth: () => number, agentDir = process.env.
     },
     killGraceMs: 5000,
     exitGraceMs: 30_000,
+    bb: bbEnv(),
   };
 }
 
@@ -68,6 +85,8 @@ interface Sheet {
   // Drops agent, send_message, list_agents, stop_agent and /pstack-agents for a
   // profile that delegates through another extension, such as pi-subagents.
   agentToolsOff: boolean;
+  // Keeps pi child processes for subagents inside a bb thread.
+  bbAgentsOff: boolean;
   piModels: Map<string, string>;
 }
 
@@ -87,6 +106,7 @@ export function parseSheet(text: string): Sheet {
     hookOff: lines.some((l) => l === "session hook: off"),
     askToolOff: lines.some((l) => l === "pi ask tool: off"),
     agentToolsOff: lines.some((l) => l === "pi agent tools: off"),
+    bbAgentsOff: lines.some((l) => l === "pi bb agents: off"),
     piModels,
   };
 }

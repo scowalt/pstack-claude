@@ -20,7 +20,8 @@ export function install(pi: ExtensionAPI, settings: Settings): void {
     if (bb) registerBbAgentTools(pi, bb, settings);
     else registerAgentTools(pi, runner, settings);
   }
-  if (!sheet?.askToolOff) registerAsk(pi, oneShot);
+  // bb gives every thread its own AskUserQuestion, which shows the question in the bb app.
+  if (!sheet?.askToolOff && !settings.bb) registerAsk(pi, oneShot);
   registerSchedule(pi, scheduler, oneShot);
   registerPromptSections(pi, settings, bb ? () => bb.isChild() : undefined);
   registerPathSkills(pi, settings);

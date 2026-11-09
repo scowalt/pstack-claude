@@ -129,6 +129,12 @@ describe("session routing", () => {
     expect(await mandateOf(nested.pi, nested.ctx)).toBe(false);
   });
 
+  test("a bb thread leaves asking to bb's AskUserQuestion", () => {
+    const { pi } = setup();
+    expect(pi.tools.has("ask_user_question")).toBe(false);
+    expect(pi.tools.has("schedule_wakeup")).toBe(true);
+  });
+
   test("pi bb agents: off keeps pi child processes", async () => {
     const { pi } = setup({ sheet: "pi bb agents: off\n" });
     expect(pi.tools.get("agent").description).toContain("a separate pi process");

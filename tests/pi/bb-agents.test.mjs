@@ -1,6 +1,6 @@
 // Inside a bb thread the agent tools start bb child threads through the bb CLI.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -112,6 +112,100 @@ describe("send_message, list_agents, stop_agent", () => {
     const stopped = await pi.call("stop_agent", { id: "thr_r" }, ctx);
     expect(callsOf("stop")[0].argv.slice(0, 3)).toEqual(["thread", "stop", "thr_r"]);
     expect(stopped.details).toEqual({ agentId: "thr_r", status: "idle" });
+  });
+});
+
+describe("schedule_wakeup", () => {
+  const wake = (pi, ctx, params) => pi.call("schedule_wakeup", { reason: "waiting on CI", ...params }, ctx);
+  const queued = () => JSON.parse(readFileSync(process.env.FAKE_BB_STATE, "utf8")).queued ?? [];
+  const texts = () => queued().map((m) => m.content[0].text);
+  const notes = () => {
+    const seen = [];
+    return { seen, ui: { notify: (message) => seen.push(message) } };
+  };
+
+  test("schedules a bb message for the clamped delay, ending in a line that says the thread sent it to itself, which outlives the session", async () => {
+    const { pi, ctx } = setup();
+    const result = await wake(pi, ctx, { delaySeconds: 5, prompt: "/loop watch PR 42" });
+    expect(callsOf("tell").map((c) => c.argv)).toEqual([["thread", "tell", "thr_self", "--send-at", "60s", "--mode", "auto", "--message-file", "-", "--json"]]);
+    const [prompt, marker] = callsOf("tell")[0].stdin.split("\n\n");
+    expect(prompt).toBe("/loop watch PR 42");
+    expect(marker).toMatch(/scheduled this message for itself with schedule_wakeup\. .*not a message from the user\.$/);
+    expect(result.details).toMatchObject({ delaySeconds: 60, id: "qmsg_1" });
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx);
+    expect(queued().map((m) => m.id)).toEqual(["qmsg_1"]);
+  });
+
+  test("a new call deletes this tool's pending message before it schedules another, and leaves the user's", async () => {
+    const mine = { id: "qmsg_user", state: "scheduled", sendAt: 1, content: [{ type: "text", text: "the user's reminder" }] };
+    const { pi, ctx } = setup({ queued: [mine] });
+    await wake(pi, ctx, { delaySeconds: 600, prompt: "first" });
+    await wake(pi, ctx, { delaySeconds: 120, prompt: "second" });
+    expect(calls().map((c) => c.argv.slice(1, 5).join(" "))).toEqual([
+      "queue list thr_self --json",
+      "tell thr_self --send-at 600s",
+      "queue list thr_self --json",
+      "queue delete thr_self qmsg_1",
+      "tell thr_self --send-at 120s",
+    ]);
+    expect(texts()).toEqual(["the user's reminder", expect.stringMatching(/^second\n\n\[schedule_wakeup\] /)]);
+  });
+
+  test("stop: true deletes the pending message and says whether there was one", async () => {
+    const { pi, ctx } = setup();
+    await wake(pi, ctx, { delaySeconds: 120, prompt: "later" });
+    expect((await wake(pi, ctx, { stop: true })).details).toEqual({ cancelled: true });
+    expect(callsOf("queue").at(-1).argv.slice(1, 5)).toEqual(["queue", "delete", "thr_self", "qmsg_1"]);
+    expect(queued()).toEqual([]);
+    expect((await wake(pi, ctx, { stop: true })).details).toEqual({ cancelled: false });
+  });
+
+  test.each(["tell", "queue"])("a failed bb %s fails the call with bb's error", async (failing) => {
+    const { pi, ctx } = setup({ failing });
+    const err = await wake(pi, ctx, { delaySeconds: 60, prompt: "later" }).catch((e) => e);
+    expect(err.message).toBe(`bb thread ${failing}: fake ${failing} failure (try again)`);
+    expect(queued()).toEqual([]);
+  });
+
+  test("a self-paced /loop re-arms through bb, and what the delivered /loop sends is the agent's, without the marker", async () => {
+    const { pi, ctx } = setup();
+    await wake(pi, ctx, { delaySeconds: 60, prompt: "/loop watch PR 42" });
+    const [delivered] = texts();
+    // Pi passes an extension command what follows its name.
+    await pi.commands.get("loop").handler(delivered.slice("/loop ".length), ctx);
+    expect(pi.userMessages).toEqual([]);
+    const sent = pi.messages.map((m) => m.message.content);
+    expect(sent).toEqual([expect.stringMatching(/^watch PR 42\n\n\[\/loop, self-paced\] .*schedule_wakeup with prompt "\/loop watch PR 42" /)]);
+    await wake(pi, ctx, { delaySeconds: 60, prompt: "/loop watch PR 42" });
+    expect(texts()).toEqual([delivered]);
+  });
+
+  test("/loop stop deletes the pending bb wakeup, after the process that scheduled it has gone", async () => {
+    const { pi, ctx } = setup();
+    const { seen, ui } = notes();
+    await wake(pi, ctx, { delaySeconds: 60, prompt: "/loop watch PR 42" });
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx);
+    await pi.commands.get("loop").handler("stop", { ...ctx, ui });
+    expect(queued()).toEqual([]);
+    expect(seen).toEqual(["Loop stopped."]);
+  });
+
+  test("a fixed-interval /loop is refused with the self-paced form, from the user or from a wakeup", async () => {
+    const { pi, ctx } = setup();
+    const { seen, ui } = notes();
+    await pi.commands.get("loop").handler("5m check the deploy", { ...ctx, ui });
+    expect(seen).toEqual([expect.stringContaining("Use /loop <prompt>")]);
+    expect(pi.userMessages).toEqual([]);
+    const err = await wake(pi, ctx, { delaySeconds: 60, prompt: "/loop 5m check the deploy" }).catch((e) => e);
+    expect(err.message).toContain("Use /loop <prompt>");
+    expect(callsOf("tell")).toEqual([]);
+  });
+
+  test("an extension command other than /loop is refused, since pi would run it as the user's", async () => {
+    const { pi, ctx } = setup();
+    const err = await wake(pi, ctx, { delaySeconds: 60, prompt: "/pstack-agents" }).catch((e) => e);
+    expect(err.message).toContain("pi would run /pstack-agents as the user's command");
+    expect(callsOf("tell")).toEqual([]);
   });
 });
 

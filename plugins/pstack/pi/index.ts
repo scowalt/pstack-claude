@@ -22,7 +22,7 @@ export function install(pi: ExtensionAPI, settings: Settings): void {
   }
   // bb gives every thread its own AskUserQuestion, which shows the question in the bb app.
   if (!sheet?.askToolOff && !settings.bb) registerAsk(pi, oneShot);
-  registerSchedule(pi, scheduler, oneShot);
+  registerSchedule(pi, scheduler, oneShot, settings.bb);
   registerPromptSections(pi, settings, bb ? () => bb.isChild() : undefined);
   registerPathSkills(pi, settings);
   // Children run detached, in their own process group, so a parent that exits

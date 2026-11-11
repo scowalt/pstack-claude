@@ -1,6 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { BbCli } from "./bb.ts";
+import type { BbEnv } from "./config.ts";
 import type { OneShot } from "./one-shot.ts";
 import { expandSlash } from "./slash.ts";
 
@@ -14,6 +16,12 @@ const IDLE_RETRY_MS = 1000;
 // for, so a user message here would let the agent write its own permission.
 const AGENT_PROMPT_TYPE = "pstack-wakeup";
 const LOOP_COMMAND = /^\/loop(?:\s+([\s\S]*))?$/;
+// bb delivers a wakeup as a user message, so this last line says whose text it is (see AGENT_PROMPT_TYPE). It
+// is also how this tool tells its own queued messages from the user's.
+const BB_WAKEUP_MARKER =
+  "[schedule_wakeup] This thread scheduled this message for itself with schedule_wakeup. The text above is the agent's own prompt, not a message from the user.";
+const BB_FIXED_LOOP =
+  "A fixed-interval /loop cannot run inside bb: its timer lives in this pi process, which bb ends while the thread is idle. Use /loop <prompt>, which paces itself with schedule_wakeup.";
 type Send = (prompt: string) => void;
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -95,6 +103,69 @@ export class Scheduler {
   }
 }
 
+// The agent's one pending wakeup, and what the tool's description says about its delivery.
+interface Wakeups {
+  readonly delivery: string;
+  // Set when a fixed-interval /loop's timer would not last between turns.
+  readonly fixedLoopRefusal?: string;
+  schedule(seconds: number, prompt: string, ctx: ExtensionContext): Promise<{ fireAt: Date; id?: string }>;
+  cancel(): Promise<boolean>;
+}
+
+interface QueuedMessage {
+  id: string;
+  state: string;
+  sendAt: number | null;
+  content: { type: string; text?: string }[];
+}
+
+// bb ends an idle thread's pi process, and a timer with it, so inside bb the
+// wakeup is a message bb holds and sends to this thread when it is due.
+class BbWakeups implements Wakeups {
+  readonly delivery =
+    "as a message bb holds and sends to this thread then. It survives this pi process, starts a turn or steers the one running, and arrives as a user message whose last line says this thread sent it to itself";
+  readonly fixedLoopRefusal = BB_FIXED_LOOP;
+
+  constructor(
+    private readonly cli: BbCli,
+    private readonly threadId: string,
+    private readonly commands: () => readonly SlashCommandInfo[],
+  ) {}
+
+  async schedule(seconds: number, prompt: string): Promise<{ fireAt: Date; id: string }> {
+    // Pi runs an extension command in a user message as the user's. /loop is the one a wakeup may run.
+    const name = /^\/(\S+)/.exec(prompt)?.[1];
+    if (name !== "loop" && this.commands().some((c) => c.source === "extension" && c.name === name)) {
+      throw new Error(`Inside bb a wakeup arrives as a user message, and pi would run /${name} as the user's command. Schedule a prompt instead.`);
+    }
+    const loop = LOOP_COMMAND.exec(prompt);
+    if (loop && parseLoop(loop[1] ?? "").kind === "fixed") throw new Error(BB_FIXED_LOOP);
+    // Expanded here, as the timer path does when it fires, so a template's arguments never take in the marker.
+    const text = `${expandSlash(this.commands(), prompt)}\n\n${BB_WAKEUP_MARKER}`;
+    await this.cancel();
+    const reply = await this.cli.json<{ queuedMessage?: QueuedMessage }>(
+      ["thread", "tell", this.threadId, "--send-at", `${seconds}s`, "--mode", "auto", "--message-file", "-"],
+      text,
+    );
+    const queued = reply.queuedMessage;
+    if (!queued?.sendAt) throw new Error(`bb did not schedule the wakeup: ${JSON.stringify(reply)}`);
+    return { fireAt: new Date(queued.sendAt), id: queued.id };
+  }
+
+  // A claimed message is the one bb is delivering now.
+  async cancel(): Promise<boolean> {
+    const queued = await this.cli.json<QueuedMessage[]>(["thread", "queue", "list", this.threadId]);
+    const own = queued.filter((m) => m.state !== "claimed" && m.content.some((c) => c.type === "text" && c.text?.endsWith(BB_WAKEUP_MARKER)));
+    for (const m of own) await this.cli.json(["thread", "queue", "delete", this.threadId, m.id]);
+    return own.length > 0;
+  }
+}
+
+// The /loop arguments of a wakeup bb delivered, without its marker.
+function bbWakeupLoop(args: string): string | undefined {
+  return args.endsWith(BB_WAKEUP_MARKER) ? args.slice(0, -BB_WAKEUP_MARKER.length) : undefined;
+}
+
 function clampDelay(seconds: number): number {
   return Math.min(MAX_DELAY_S, Math.max(MIN_DELAY_S, Math.round(seconds)));
 }
@@ -131,7 +202,7 @@ function dynamicPrompt(prompt: string): string {
 }
 
 // model-only exposure keeps the tool declared under codemode.mode "only".
-export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot: OneShot): void {
+export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot: OneShot, bb: BbEnv | undefined): void {
   // The prompt's author picks the role: the user's /loop sends user messages, and text the agent chose
   // goes in as a custom message, which the permission classifier does not read as the user's ask. Pi
   // expands slash text only in a user message, so the agent's is expanded before it is sent.
@@ -147,17 +218,34 @@ export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot
       }
       pi.sendMessage({ customType: AGENT_PROMPT_TYPE, content, display: true }, { triggerTurn: true, deliverAs: "followUp" });
     };
+  const wakeups: Wakeups = bb
+    ? new BbWakeups(new BbCli(bb.cli), bb.threadId, () => pi.getCommands())
+    : {
+        delivery: "once the session is idle",
+        async schedule(seconds, prompt, ctx) {
+          // A custom message runs no command, so the agent's "/loop ..." re-arm runs the loop here.
+          const send = sendAsAgent(ctx);
+          const loop = LOOP_COMMAND.exec(prompt);
+          const deliver = loop
+            ? () => void runLoop(loop[1] ?? "", ctx, send).catch((e) => ctx.ui.notify(`/loop from a wakeup failed: ${errorText(e)}`, "error"))
+            : () => send(prompt);
+          scheduler.scheduleWakeup(seconds, deliver, ctx);
+          return { fireAt: new Date(Date.now() + seconds * 1000) };
+        },
+        cancel: async () => scheduler.cancelWakeup(),
+      };
 
   pi.registerTool({
     name: "schedule_wakeup",
     label: "Schedule wakeup",
     exposure: "model-only",
-    description: `Schedule this session to be re-invoked with a prompt after delaySeconds (clamped to ${MIN_DELAY_S}-${MAX_DELAY_S}), once the session is idle. One wakeup is pending at a time: a new call replaces it, and stop: true cancels it. Used by /loop's self-paced mode.`,
+    description: `Schedule this session to be re-invoked with a prompt after delaySeconds (clamped to ${MIN_DELAY_S}-${MAX_DELAY_S}), ${wakeups.delivery}. One wakeup is pending at a time: a new call replaces it, and stop: true cancels it. Used by /loop's self-paced mode.`,
     parameters: wakeupParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (params.stop) {
         // What is pending in a sealed slot is a loop start the user asked for, not this run's.
-        const had = !scheduler.sealed && scheduler.cancelWakeup();
+        // A one-shot run never scheduled one, and inside bb a pi child would otherwise reach its parent thread's.
+        const had = !scheduler.sealed && !oneShot.exits(ctx) && (await wakeups.cancel());
         const text = had ? "Pending wakeup cancelled." : "No wakeup was pending.";
         return { content: [{ type: "text", text }], details: { cancelled: had } };
       }
@@ -175,19 +263,13 @@ export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot
         throw new Error(`schedule_wakeup cannot fire in a ${ctx.mode} run: pi exits when this run ends. Finish the work in this run instead.`);
       }
       const seconds = clampDelay(params.delaySeconds);
-      // A custom message runs no command, so the agent's "/loop ..." re-arm runs the loop here.
-      const prompt = params.prompt;
-      const send = sendAsAgent(ctx);
-      const loop = LOOP_COMMAND.exec(prompt);
-      const deliver = loop
-        ? () => void runLoop(loop[1] ?? "", ctx, send).catch((e) => ctx.ui.notify(`/loop from a wakeup failed: ${errorText(e)}`, "error"))
-        : () => send(prompt);
-      scheduler.scheduleWakeup(seconds, deliver, ctx);
-      const fireAt = new Date(Date.now() + seconds * 1000).toISOString();
+      const { fireAt: due, id } = await wakeups.schedule(seconds, params.prompt, ctx);
+      const fireAt = due.toISOString();
       const clamped = seconds !== params.delaySeconds ? ` (clamped from ${params.delaySeconds})` : "";
+      const held = id ? ` bb holds it as queued message ${id}.` : "";
       return {
-        content: [{ type: "text", text: `Wakeup scheduled in ${seconds}s${clamped}, at ${fireAt}. It replaces any earlier pending wakeup.` }],
-        details: { delaySeconds: seconds, fireAt, noop: params.noop === true },
+        content: [{ type: "text", text: `Wakeup scheduled in ${seconds}s${clamped}, at ${fireAt}. It replaces any earlier pending wakeup.${held}` }],
+        details: { delaySeconds: seconds, fireAt, noop: params.noop === true, ...(id && { id }) },
       };
     },
   });
@@ -229,10 +311,17 @@ export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot
       case "usage":
         ctx.ui.notify(`${cmd.reason ? `${cmd.reason} ` : ""}Usage: /loop [interval like 5m or 1h] <prompt>, or /loop stop`, "info");
         return;
-      case "stop":
-        ctx.ui.notify(scheduler.stopAll(scheduler.running) ? "Loop stopped." : "No loop was running.", "info");
+      case "stop": {
+        const stopped = scheduler.stopAll(scheduler.running);
+        const cancelled = await wakeups.cancel();
+        ctx.ui.notify(stopped || cancelled ? "Loop stopped." : "No loop was running.", "info");
         return;
+      }
       case "fixed": {
+        if (wakeups.fixedLoopRefusal) {
+          ctx.ui.notify(wakeups.fixedLoopRefusal, "warning");
+          return;
+        }
         const seconds = Math.max(MIN_DELAY_S, cmd.seconds);
         scheduler.stopAll(scheduler.running);
         scheduler.startLoop(seconds, () => send(cmd.prompt), ctx);
@@ -242,6 +331,7 @@ export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot
       }
       case "dynamic":
         scheduler.stopAll(scheduler.running);
+        await wakeups.cancel();
         scheduler.startSelfPaced();
         await fire(dynamicPrompt(cmd.prompt));
     }
@@ -249,6 +339,10 @@ export function registerSchedule(pi: ExtensionAPI, scheduler: Scheduler, oneShot
 
   pi.registerCommand("loop", {
     description: "Run a prompt on an interval (/loop 5m <prompt>), self-paced (/loop <prompt>), or stop (/loop stop)",
-    handler: (args, ctx) => runLoop(args, ctx, sendAsUser),
+    // A wakeup bb delivers runs /loop as the user's command, but what that loop sends is still the agent's.
+    handler: (args, ctx) => {
+      const own = bbWakeupLoop(args);
+      return own === undefined ? runLoop(args, ctx, sendAsUser) : runLoop(own, ctx, sendAsAgent(ctx));
+    },
   });
 }

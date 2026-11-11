@@ -41,7 +41,7 @@ function failure(args: string[], r: Run): Error {
   return new Error(`bb ${args.slice(0, 2).join(" ")} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 1000)}`);
 }
 
-class BbCli {
+export class BbCli {
   constructor(private readonly cli: string) {}
 
   run(args: string[], { input, signal }: { input?: string; signal?: AbortSignal } = {}): Promise<Run> {

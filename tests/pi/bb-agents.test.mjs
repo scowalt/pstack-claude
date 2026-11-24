@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { install } from "../../plugins/pstack/pi/index.ts";
@@ -16,15 +16,20 @@ let w;
 let saved;
 beforeEach(() => (saved = { ...process.env }));
 // Registered before useWorld's cleanup, so it runs first: a batch tracker is
-// detached so it outlives pi, and this stops the one each batch has, with the
-// bb calls it is making, while its lease file still names it.
+// detached so it outlives pi, and this stops every one this test started, with
+// the bb calls it is making, while its world still exists. A tracker's argv
+// holds its record's path, under this test's own temporary world.
 afterEach(() => {
-  const dir = w && join(w.agentDir, "pstack", "bb-batches", "thr_self");
-  for (const name of dir && existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".tracker")) : []) {
-    try {
-      const { pid } = JSON.parse(readFileSync(join(dir, name), "utf8"));
-      if (Number.isInteger(pid) && pid > 1) process.kill(-pid, "SIGKILL");
-    } catch {}
+  if (w) {
+    const root = dirname(w.agentDir);
+    const found = spawnSync("pgrep", ["-f", `bb-batch\\.mjs ${root}/`], { encoding: "utf8" }).stdout;
+    for (const pid of found.split("\n").map(Number).filter((p) => Number.isInteger(p) && p > 1)) {
+      for (const target of [-pid, pid]) {
+        try {
+          process.kill(target, "SIGKILL");
+        } catch {}
+      }
+    }
   }
   process.env = saved;
 });

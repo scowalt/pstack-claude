@@ -25,13 +25,15 @@ const [command, sub, ...rest] = process.argv.slice(2);
 const stdin = readFileSync(0, "utf8");
 const statePath = process.env.FAKE_BB_STATE;
 const lock = `${statePath}.lock`;
+// A call never waits long for the lock: the process holding it may have been killed with its tracker.
+const lockBy = Date.now() + 5000;
 for (;;) {
   try {
     mkdirSync(lock);
     break;
   } catch (e) {
     // The test's world, and the state with it, is gone.
-    if (e.code !== "EEXIST") process.exit(1);
+    if (e.code !== "EEXIST" || Date.now() > lockBy) process.exit(1);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
   }
 }

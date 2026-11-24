@@ -465,6 +465,45 @@ describe("batch", () => {
     expect(callsOf("queue").some((c) => c.argv[2] === "list" && c.argv[3] === "thr_child1")).toBe(true);
   });
 
+  test("a notice bb has yet to send an idle agent, such as its own helper finishing, holds the batch", async () => {
+    await fanOut(2);
+    finish("thr_child1");
+    bbDoes("__queue", "thr_child2", JSON.stringify({ systemNotice: "child-completed", sendAt: Date.now() + 3_600_000 }));
+    finish("thr_child2", { output: "waiting on my helper" });
+    await sleep(500);
+    expect(wakes()).toEqual([]);
+
+    // bb sends the notice and starts the agent's turn together.
+    bbDoes("__set", "thr_child2", JSON.stringify({ status: "active" }));
+    bbDoes("__state", JSON.stringify({ queued: state().queued.filter((m) => m.threadId !== "thr_child2") }));
+    finish("thr_child2", { output: "the real report" });
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    expect(wakes()[0].text).toContain("the real report");
+  });
+
+  test("an agent recorded while an empty batch's held message is withdrawn is handed back and reports on its own", async () => {
+    setup({ threads: { thr_self: { status: "active" } } });
+    // A queue delete that takes 1 s, so the agent is recorded while the withdraw is in flight.
+    const slowBb = join(w.agentDir, "slow-delete-bb.sh");
+    const started = join(w.agentDir, "delete-started");
+    writeFileSync(slowBb, `#!/bin/bash\nif [ "$2" = queue ] && [ "$3" = delete ]; then touch ${started}; sleep 1; fi\nexec ${fakeBb} "$@"\n`, { mode: 0o755 });
+    const { Batches } = await import("../../plugins/pstack/pi/bb-batch.mjs");
+    const batches = new Batches({ cli: slowBb, threadId: "thr_self", dir: batchDir(), timing: bbBatch });
+    const id = await batches.join(async () => {
+      // The parent's run is cut short while its first agent starts, so bb shows it idle.
+      bbDoes("__set", "thr_self", JSON.stringify({ status: "idle" }));
+      bbDoes("__set", "thr_late", JSON.stringify({ status: "active", parentThreadId: "thr_self", parentNotifications: "stuck" }));
+      await waitFor(() => existsSync(started));
+      return "thr_late";
+    });
+    expect(id).toBe("thr_late");
+    await waitFor(() => state().threads.thr_late.parentNotifications === "auto");
+    await waitFor(batchOver);
+    finish("thr_late");
+    expect(kinds()).toEqual(["child-completed"]);
+  });
+
   test("an agent its batch failed to record reports on its own, and later batches still record theirs", async () => {
     setup();
     const { Batches } = await import("../../plugins/pstack/pi/bb-batch.mjs");

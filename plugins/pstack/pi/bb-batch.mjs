@@ -29,9 +29,9 @@ import { BbCli, RUNNING, TRACKER_CALL_TIMEOUT_MS, resultText } from "./bb-cli.mj
 // covers a heartbeat plus one bb call the tracker kills at its timeout.
 // boundMs: once one agent has finished, the batch waits this long for the rest
 // before it reports the finished ones. Of 172 groups of idle siblings bb
-// started within two minutes of each other (Nov 2026), the last's final update
-// came within 16 minutes of the first's in 9 in 10 and within 34 in 19 in 20,
-// so 30 minutes rarely cuts a batch short.
+// started within two minutes of each other (Sep to Nov 2026, timed by each
+// thread's turns), 30 minutes cuts 11 to 17 in 100 short. A cut loses nothing:
+// the agents still running are handed back and report on their own.
 // maxMs: the batch reports this long after it opened even if no agent has
 // finished, so agents that keep booking their own wakeups cannot hold it
 // forever. Of 378 groups of sibling threads bb started within two minutes of
@@ -201,13 +201,14 @@ const pending = (m) => m.state !== "failed_exhausted" && m.waitingOn?.kind !== "
 
 // An agent has finished when it is not running, bb holds nothing it will send
 // it, and none of its own agents still run. bb's children list already says
-// whether a thread's queue holds anything: "none" leaves only bb's own notices,
-// which it sends within 2 s, before the second of the two looks.
-async function finished(bb, member) {
+// whether a thread's queue holds anything, but "none" still counts bb's own
+// notices, such as one of its helpers finishing, which can take over 5 s to
+// arrive. So the look that would confirm the batch (confirm) reads the queue.
+async function finished(bb, member, confirm) {
   if (member.status === "deleted") return true;
   if (RUNNING.has(member.status)) return false;
   const [queued, children] = await Promise.all([
-    member.queuedWork === "none" ? [] : bb.json(["thread", "queue", "list", member.id]),
+    member.queuedWork === "none" && !confirm ? [] : bb.json(["thread", "queue", "list", member.id]),
     bb.json(["thread", "list", "--parent-thread", member.id, "--include-hidden"]),
   ]);
   return !queued.some(pending) && !children.some((c) => RUNNING.has(c.status));
@@ -262,9 +263,11 @@ async function step(bb, path, look) {
       await bb.json(["thread", "queue", "delete", parent, row]).catch(async (e) => {
         if (!(await delivered(bb, record))) throw e;
       });
-      return true;
+      // An agent recorded while the message was withdrawn is handed back on the next look.
+      look.over = true;
+      return false;
     }
-    const done = await Promise.all(members.map((m) => finished(bb, m)));
+    const done = await Promise.all(members.map((m) => finished(bb, m, look.allDone)));
     const all = done.every(Boolean);
     if (done.some(Boolean)) look.firstDone ??= Date.now();
     // Two looks in a row, so an agent idle only for the moment before bb starts its next turn is not taken for finished.

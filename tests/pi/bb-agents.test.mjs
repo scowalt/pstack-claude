@@ -30,7 +30,24 @@ const flag = (argv, name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1]
 let saved;
 beforeEach(() => (saved = { ...process.env }));
 afterEach(() => {
+  // A batch tracker is detached so it outlives pi; stop the ones this test started before its world is deleted.
+  const dir = w && join(w.agentDir, "pstack", "bb-batches", "thr_self");
+  for (const name of dir && existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".pid")) : []) {
+    try {
+      process.kill(Number(readFileSync(join(dir, name), "utf8")), "SIGKILL");
+    } catch {}
+  }
   process.env = saved;
+});
+
+describe("bb CLI", () => {
+  test("a bb call that hangs is killed, so a detached tracker never waits on it forever", async () => {
+    const { BbCli } = await import("../../plugins/pstack/pi/bb-cli.mjs");
+    const started = Date.now();
+    const r = await new BbCli("sleep").run(["30"], { timeoutMs: 200 });
+    expect(r.code).not.toBe(0);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
 });
 
 describe("agent", () => {

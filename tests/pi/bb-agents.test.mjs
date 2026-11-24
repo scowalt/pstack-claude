@@ -1,7 +1,7 @@
 // Inside a bb thread the agent tools start bb child threads through the bb CLI.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,12 +10,28 @@ import { agentBody, alive, fakeCtx, fakePi, gitRepo, readEntries, resultText, sl
 
 const fakeBb = fileURLToPath(new URL("./fake-bb.mjs", import.meta.url));
 const bb = { cli: fakeBb, projectId: "proj_p", threadId: "thr_self", environmentId: "env_e" };
-const bbBatch = { pollMs: 30, heartbeatMs: 150, deadlineS: 600 };
-const setupWorld = useWorld();
+const bbBatch = { pollMs: 30, heartbeatMs: 150, deadlineS: 600, staleMs: 1500, boundMs: 60_000 };
 
 let w;
-function setup({ threads = {}, sheet, ...state } = {}) {
-  const made = setupWorld({ sheet, settings: { bb, bbBatch } });
+let saved;
+beforeEach(() => (saved = { ...process.env }));
+// Registered before useWorld's cleanup, so it runs first: a batch tracker is
+// detached so it outlives pi, and this stops the one each batch has, with the
+// bb calls it is making, while its lease file still names it.
+afterEach(() => {
+  const dir = w && join(w.agentDir, "pstack", "bb-batches", "thr_self");
+  for (const name of dir && existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".tracker")) : []) {
+    try {
+      const { pid } = JSON.parse(readFileSync(join(dir, name), "utf8"));
+      if (Number.isInteger(pid) && pid > 1) process.kill(-pid, "SIGKILL");
+    } catch {}
+  }
+  process.env = saved;
+});
+const setupWorld = useWorld();
+
+function setup({ threads = {}, sheet, timing, ...state } = {}) {
+  const made = setupWorld({ sheet, settings: { bb, bbBatch: { ...bbBatch, ...timing } } });
   w = made.w;
   process.env.FAKE_BB_STATE = join(w.agentDir, "bb-state.json");
   process.env.FAKE_BB_LOG = join(w.agentDir, "bb.log");
@@ -26,19 +42,6 @@ function setup({ threads = {}, sheet, ...state } = {}) {
 const calls = () => readEntries(process.env.FAKE_BB_LOG);
 const callsOf = (sub) => calls().filter((c) => c.argv[1] === sub);
 const flag = (argv, name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : null);
-
-let saved;
-beforeEach(() => (saved = { ...process.env }));
-afterEach(() => {
-  // A batch tracker is detached so it outlives pi; stop the ones this test started before its world is deleted.
-  const dir = w && join(w.agentDir, "pstack", "bb-batches", "thr_self");
-  for (const name of dir && existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".pid")) : []) {
-    try {
-      process.kill(Number(readFileSync(join(dir, name), "utf8")), "SIGKILL");
-    } catch {}
-  }
-  process.env = saved;
-});
 
 describe("bb CLI", () => {
   test("a bb call that hangs is killed, so a detached tracker never waits on it forever", async () => {
@@ -127,15 +130,18 @@ describe("batch", () => {
   };
   const finish = (id, fields = {}) => bbDoes("__set", id, JSON.stringify({ status: "idle", output: `${id}'s report`, ...fields }));
   const batchDir = () => join(w.agentDir, "pstack", "bb-batches", "thr_self");
-  const trackerPid = () => Number(readFileSync(join(batchDir(), readdirSync(batchDir()).find((n) => n.endsWith(".pid"))), "utf8"));
+  const hasTracker = () => existsSync(batchDir()) && readdirSync(batchDir()).some((n) => n.endsWith(".tracker"));
+  const trackerPid = () => JSON.parse(readFileSync(join(batchDir(), readdirSync(batchDir()).find((n) => n.endsWith(".tracker"))), "utf8")).pid;
+  const kinds = () => wakes().map((m) => m.kind);
+  const rowOf = (threadId) => state().queued.find((m) => m.threadId === threadId).id;
   const batchOver = () => !existsSync(batchDir()) || readdirSync(batchDir()).length === 0;
 
-  // One response that starts n batched agents, then ends its turn.
-  async function fanOut(n) {
-    const made = setup();
+  // One response of a running parent that starts n batched agents, then ends its turn unless told not to.
+  async function fanOut(n, { endTurn = true, ...options } = {}) {
+    const made = setup({ threads: { thr_self: { status: "active" } }, ...options });
     const calls = Array.from({ length: n }, (_, i) => made.pi.call("agent", { description: `candidate ${i + 1}`, prompt: "go", run_in_background: true, batch: true }, made.ctx));
     const ids = (await Promise.all(calls)).map((r) => r.details.agentId).sort();
-    await made.pi.emit("turn_end", {}, made.ctx);
+    if (endTurn) await made.pi.emit("turn_end", {}, made.ctx);
     return { ...made, ids };
   }
 
@@ -180,7 +186,7 @@ describe("batch", () => {
 
   test("a tracker that dies mid-batch is started again when the parent's pi starts again, and the batch still wakes it exactly once", async () => {
     await fanOut(3);
-    await waitFor(() => existsSync(batchDir()) && readdirSync(batchDir()).some((n) => n.endsWith(".pid")));
+    await waitFor(hasTracker);
     const first = trackerPid();
     process.kill(first, "SIGKILL");
     await waitFor(() => !alive(first));
@@ -205,7 +211,7 @@ describe("batch", () => {
 
   test("when no tracker runs, the held message fires on its own, and the next run hands the agents still running back to bb's own notices", async () => {
     const { pi, ctx } = await fanOut(2);
-    await waitFor(() => existsSync(batchDir()) && readdirSync(batchDir()).some((n) => n.endsWith(".pid")));
+    await waitFor(hasTracker);
     const pid = trackerPid();
     process.kill(pid, "SIGKILL");
     await waitFor(() => !alive(pid));
@@ -234,6 +240,163 @@ describe("batch", () => {
     finish("thr_child1", { output: "the final report" });
     await waitFor(() => wakes().length > 0);
     expect(wakes()[0].text).toContain("the final report");
+  });
+
+  test("an agent in error that bb will retry has not finished, and the batch carries the retry's real report", async () => {
+    await fanOut(2);
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "error", output: "every account is out of quota" }));
+    bbDoes("__queue", "thr_child1", JSON.stringify({ payload: { kind: "retry" }, sendAt: Date.now() + 3_600_000 }));
+    finish("thr_child2");
+    await sleep(400);
+    expect(kinds()).toEqual(["child-failed"]);
+
+    // bb sends the retry, and the turn it starts finishes.
+    bbDoes("__fire", "thr_child1", rowOf("thr_child1"));
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "active" }));
+    finish("thr_child1", { output: "the real report" });
+    await waitFor(() => wakes().length === 2);
+    expect(kinds()).toEqual(["child-failed", "queued"]);
+    expect(wakes()[1].text).toContain("status: completed\nthread: @thread:thr_child1\n\nthe real report");
+  });
+
+  test("a row bb will not send by itself, such as one whose retries are spent, does not hold the batch", async () => {
+    await fanOut(2);
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "error", output: "gave up" }));
+    bbDoes("__queue", "thr_child1", JSON.stringify({ state: "failed_exhausted" }));
+    bbDoes("__queue", "thr_child2", JSON.stringify({ waitingOn: { kind: "superseded" } }));
+    finish("thr_child2");
+    await waitFor(() => wakes().length === 2);
+    expect(kinds()).toEqual(["child-failed", "queued"]);
+    expect(wakes()[1].text).toContain("status: failed\nthread: @thread:thr_child1\n\ngave up");
+  });
+
+  test("an idle agent that bb still holds a message for, such as its own batch's report, has not finished", async () => {
+    await fanOut(1);
+    bbDoes("__queue", "thr_child1", JSON.stringify({ sendAt: Date.now() + 3_600_000 }));
+    finish("thr_child1", { output: "Started 1 worker with batch: true; waiting for the batch report." });
+    await sleep(400);
+    expect(wakes()).toEqual([]);
+
+    bbDoes("__fire", "thr_child1", rowOf("thr_child1"));
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "active" }));
+    finish("thr_child1", { output: "the final report" });
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toContain("the final report");
+    expect(wakes()[0].text).not.toContain("waiting for the batch report");
+  });
+
+  test("after the batch reports, every agent is back on bb's usual notices, so a later turn reports on its own", async () => {
+    const { ids } = await fanOut(2);
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    await waitFor(batchOver);
+    expect(ids.map((id) => state().threads[id].parentNotifications)).toEqual(["auto", "auto"]);
+
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "active" }));
+    finish("thr_child1", { output: "a later turn" });
+    expect(kinds()).toEqual(["queued", "child-completed"]);
+  });
+
+  test("the held message is kept back from the first agent on, so a long tool call later in the response cannot let it fire", async () => {
+    const { pi, ctx } = await fanOut(2, { endTurn: false, timing: { deadlineS: 1 } });
+    await sleep(1500);
+    // Any bb call lets the fake's scheduler send what is due.
+    bbDoes("__state", "{}");
+    expect(wakes()).toEqual([]);
+
+    await pi.emit("turn_end", {}, ctx);
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    expect(kinds()).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+  });
+
+  test("one agent still running long after the first finished does not hide its finished siblings", async () => {
+    await fanOut(3, { timing: { boundMs: 600 } });
+    finish("thr_child1");
+    finish("thr_child2");
+    await sleep(200);
+    expect(wakes()).toEqual([]);
+
+    await waitFor(() => wakes().length > 0);
+    const { text } = wakes()[0];
+    expect(text).toStartWith("[pstack batch] 2 of the 3 agents");
+    expect(text).toContain("thread: @thread:thr_child1\n\nthr_child1's report");
+    expect(text).toContain("thread: @thread:thr_child2\n\nthr_child2's report");
+    expect(text).toContain("status: running\nthread: @thread:thr_child3\n\nStill running.");
+    await waitFor(batchOver);
+    finish("thr_child3");
+    expect(kinds()).toEqual(["queued", "child-completed"]);
+    expect(wakes()[1].child).toBe("thr_child3");
+  });
+
+  test("a batch whose parent's run ended without sealing it still reports, so its tracker never keeps the message back forever", async () => {
+    await fanOut(2, { endTurn: false });
+    // pi died mid-response: no turn_end, and bb shows the parent no longer running.
+    bbDoes("__set", "thr_self", JSON.stringify({ status: "error" }));
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    expect(kinds()).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+  });
+
+  test("an agent its batch failed to record reports on its own, and later batches still record theirs", async () => {
+    setup();
+    const { Batches } = await import("../../plugins/pstack/pi/bb-batch.mjs");
+    const batches = new Batches({ cli: fakeBb, threadId: "thr_self", dir: batchDir(), timing: bbBatch });
+    const spawnChild = () => JSON.parse(spawnSync(fakeBb, ["thread", "spawn", "--parent-notifications", "stuck", "--json"], { encoding: "utf8" }).stdout).id;
+    const records = () => readdirSync(batchDir()).filter((n) => n.endsWith(".json"));
+
+    // The record's write fails: here it has gone from under the batch.
+    const lost = await batches.join(async () => {
+      for (const name of records()) rmSync(join(batchDir(), name));
+      return spawnChild();
+    });
+    expect(state().threads[lost].parentNotifications).toBe("auto");
+    await batches.seal().catch(() => {});
+
+    const kept = await batches.join(async () => spawnChild());
+    const [name] = records();
+    expect(JSON.parse(readFileSync(join(batchDir(), name), "utf8")).members).toEqual([kept]);
+    expect(state().threads[kept].parentNotifications).toBe("stuck");
+  });
+
+  test("a switch back to bb's usual notices that fails is retried, and the batch is kept until it succeeds", async () => {
+    const { ids } = await fanOut(2);
+    bbDoes("__state", JSON.stringify({ failing: "update" }));
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(batchOver()).toBe(false);
+    expect(ids.map((id) => state().threads[id].parentNotifications)).toEqual(["stuck", "stuck"]);
+
+    bbDoes("__state", JSON.stringify({ failing: null }));
+    await waitFor(() => ids.every((id) => state().threads[id].parentNotifications === "auto"));
+    await waitFor(batchOver);
+    expect(kinds()).toEqual(["queued"]);
+  });
+
+  test("a live tracker that cannot reach bb is replaced on the parent's next run, and stops once it is", async () => {
+    const { pi, ctx } = await fanOut(2, { timing: { staleMs: 800 } });
+    await waitFor(hasTracker);
+    const first = trackerPid();
+    bbDoes("__state", JSON.stringify({ failFor: [first] }));
+    finish("thr_child1");
+    finish("thr_child2");
+    await sleep(1100);
+    expect(wakes()).toEqual([]);
+    expect(alive(first)).toBe(true);
+
+    await pi.emit("agent_start", {}, ctx);
+    expect(trackerPid()).not.toBe(first);
+    await waitFor(() => wakes().length > 0);
+    expect(kinds()).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    await waitFor(() => !alive(first));
   });
 
   test("batch needs run_in_background, and is not offered outside bb", async () => {
@@ -297,7 +460,7 @@ describe("schedule_wakeup", () => {
   });
 
   test("a new call deletes this tool's pending message before it schedules another, and leaves the user's", async () => {
-    const mine = { id: "qmsg_user", state: "scheduled", sendAt: 1, content: [{ type: "text", text: "the user's reminder" }] };
+    const mine = { id: "qmsg_user", threadId: "thr_self", state: "scheduled", sendAt: Date.now() + 3_600_000, content: [{ type: "text", text: "the user's reminder" }] };
     const { pi, ctx } = setup({ queued: [mine] });
     await wake(pi, ctx, { delaySeconds: 600, prompt: "first" });
     await wake(pi, ctx, { delaySeconds: 120, prompt: "second" });

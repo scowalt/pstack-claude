@@ -3,16 +3,19 @@
 // logs each call's argv and stdin to FAKE_BB_LOG and answers from the JSON
 // state in FAKE_BB_STATE: { threads: { <id>: { title, status, parentThreadId,
 // output, parentNotifications } }, waitExit, spawnStatus, queued, failing,
-// wakes }. A spawn adds a thread with the next id, a tell with --send-at adds
-// a queued message, and a command whose subcommand is `failing` fails as bb
-// does with --json.
+// failFor, wakes }. A spawn adds a thread with the next id, a tell with
+// --send-at adds a queued message to that thread's queue, and a command whose
+// subcommand is `failing`, or any command a process in failFor runs, fails as
+// bb does with --json. As bb's scheduler would, each call first sends every
+// queued message whose time has passed.
 //
 // wakes lists what bb would have delivered to a thread, in order: a tell, a
 // queued message sent or fired, and a child's outcome its parent-notifications
 // setting reports (auto: completed and failed; stuck: failed). Tests drive bb's
-// side with two subcommands bb does not have: `thread __set <id> <json>`
-// changes a thread, and `thread __fire <threadId> <messageId>` sends a queued
-// message as its scheduled time would.
+// side with subcommands bb does not have: `thread __set <id> <json>` changes a
+// thread, `thread __fire <threadId> <messageId>` sends a queued message as its
+// scheduled time would, `thread __queue <threadId> <json>` adds a row to a
+// thread's queue, and `thread __state <json>` changes the top-level state.
 //
 // The batch tracker calls this from its own process while the test does, so
 // every call holds a lock over the state, and the state is replaced whole.
@@ -26,7 +29,9 @@ for (;;) {
   try {
     mkdirSync(lock);
     break;
-  } catch {
+  } catch (e) {
+    // The test's world, and the state with it, is gone.
+    if (e.code !== "EEXIST") process.exit(1);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
   }
 }
@@ -49,12 +54,18 @@ const wake = (threadId, kind, extra) => state.wakes.push({ threadId, kind, ...ex
 const queuedText = (m) => m.content[0].text;
 
 if (command !== "thread") process.exit(3);
-if (state.failing === sub) {
+if (state.failing === sub || state.failFor?.includes(process.ppid)) {
   print({ ok: false, error: { message: `fake ${sub} failure`, hint: "try again" } });
   process.exit(1);
 }
 state.queued ??= [];
 state.wakes ??= [];
+const due = state.queued.filter((m) => m.sendAt && m.sendAt <= Date.now());
+for (const m of due) wake(m.threadId, "queued", { text: queuedText(m) });
+if (due.length) {
+  state.queued = state.queued.filter((m) => !due.includes(m));
+  save();
+}
 switch (sub) {
   case "show":
     print({ thread: thread(rest[0]) });
@@ -111,18 +122,27 @@ switch (sub) {
       break;
     }
     state.queuedCount = (state.queuedCount ?? 0) + 1;
-    const queuedMessage = { id: `qmsg_${state.queuedCount}`, state: "scheduled", sendAt: Date.now() + Number.parseInt(sendAt, 10) * 1000, content: [{ type: "text", text: stdin }] };
+    const queuedMessage = { id: `qmsg_${state.queuedCount}`, threadId: rest[0], state: "scheduled", sendAt: Date.now() + Number.parseInt(sendAt, 10) * 1000, content: [{ type: "text", text: stdin }] };
     state.queued.push(queuedMessage);
     save();
     print({ ok: true, delivery: "queued", queuedMessage });
     break;
   }
+  case "__queue":
+    state.queuedCount = (state.queuedCount ?? 0) + 1;
+    state.queued.push({ id: `qmsg_${state.queuedCount}`, threadId: rest[0], state: "scheduled", waitingOn: { kind: "time" }, content: [{ type: "text", text: "Please continue." }], ...JSON.parse(rest[1]) });
+    save();
+    break;
+  case "__state":
+    Object.assign(state, JSON.parse(rest[0]));
+    save();
+    break;
   case "__fire":
   case "queue": {
     const action = sub === "__fire" ? "send" : rest[0];
     const [threadId, id] = sub === "__fire" ? rest : rest.slice(1);
     const message = state.queued.find((m) => m.id === id);
-    if (action === "list") print(state.queued);
+    if (action === "list") print(state.queued.filter((m) => m.threadId === threadId));
     else if (action === "delete") {
       state.queued = state.queued.filter((m) => m !== message);
       save();

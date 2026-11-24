@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
+import type { BatchTiming } from "./bb-batch.mjs";
+
 const PARENT_MODEL_ALIASES = ["inherit-parent", "auto"];
 
 // A parent passes it to each agent it starts, so the agent knows its depth.
@@ -46,8 +48,8 @@ export interface Settings {
   exitGraceMs: number;
   // Set when pi runs as a bb thread: the agent tools then start bb child threads.
   bb?: BbEnv;
-  // How often a bb batch's tracker looks, and how far out it keeps the batch's held message. Tests shorten it.
-  bbBatch?: { pollMs: number; heartbeatMs: number; deadlineS: number };
+  // A bb batch tracker's timing. Tests shorten it.
+  bbBatch?: BatchTiming;
 }
 
 // Pi re-runs itself for children when it can: the same runtime and CLI script,

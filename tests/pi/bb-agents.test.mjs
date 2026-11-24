@@ -1,18 +1,21 @@
 // Inside a bb thread the agent tools start bb child threads through the bb CLI.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { agentBody, gitRepo, readEntries, resultText, useWorld } from "./harness.mjs";
+import { install } from "../../plugins/pstack/pi/index.ts";
+import { agentBody, alive, fakeCtx, fakePi, gitRepo, readEntries, resultText, sleep, useWorld, waitFor } from "./harness.mjs";
 
 const fakeBb = fileURLToPath(new URL("./fake-bb.mjs", import.meta.url));
 const bb = { cli: fakeBb, projectId: "proj_p", threadId: "thr_self", environmentId: "env_e" };
+const bbBatch = { pollMs: 30, heartbeatMs: 150, deadlineS: 600 };
 const setupWorld = useWorld();
 
 let w;
 function setup({ threads = {}, sheet, ...state } = {}) {
-  const made = setupWorld({ sheet, settings: { bb } });
+  const made = setupWorld({ sheet, settings: { bb, bbBatch } });
   w = made.w;
   process.env.FAKE_BB_STATE = join(w.agentDir, "bb-state.json");
   process.env.FAKE_BB_LOG = join(w.agentDir, "bb.log");
@@ -59,6 +62,9 @@ describe("agent", () => {
     expect(result.details).toEqual({ agentId: "thr_child1", status: "running" });
     expect(flag(callsOf("spawn")[0].argv, "--parent-notifications")).toBe("auto");
     expect(callsOf("wait")).toEqual([]);
+    await pi.emit("turn_end", {}, ctx);
+    await pi.emit("agent_start", {}, ctx);
+    expect(calls().map((c) => c.argv[1])).toEqual(["show", "spawn"]);
   });
 
   test("a thread bb puts in error fails the foreground call", async () => {
@@ -84,6 +90,136 @@ describe("agent", () => {
     const err = await pi.call("agent", { description: "x", prompt: "x" }, ctx).catch((e) => e);
     expect(err.message).toContain("nest at most 3 layers");
     expect(callsOf("spawn")).toEqual([]);
+  });
+});
+
+describe("batch", () => {
+  const state = () => JSON.parse(readFileSync(process.env.FAKE_BB_STATE, "utf8"));
+  // What bb delivered to this thread: tells, held messages sent or fired, and the child outcomes bb reports.
+  const wakes = () => (state().wakes ?? []).filter((m) => m.threadId === "thr_self");
+  const bbDoes = (...args) => {
+    const r = spawnSync(fakeBb, ["thread", ...args], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error(r.stdout || r.stderr);
+  };
+  const finish = (id, fields = {}) => bbDoes("__set", id, JSON.stringify({ status: "idle", output: `${id}'s report`, ...fields }));
+  const batchDir = () => join(w.agentDir, "pstack", "bb-batches", "thr_self");
+  const trackerPid = () => Number(readFileSync(join(batchDir(), readdirSync(batchDir()).find((n) => n.endsWith(".pid"))), "utf8"));
+  const batchOver = () => !existsSync(batchDir()) || readdirSync(batchDir()).length === 0;
+
+  // One response that starts n batched agents, then ends its turn.
+  async function fanOut(n) {
+    const made = setup();
+    const calls = Array.from({ length: n }, (_, i) => made.pi.call("agent", { description: `candidate ${i + 1}`, prompt: "go", run_in_background: true, batch: true }, made.ctx));
+    const ids = (await Promise.all(calls)).map((r) => r.details.agentId).sort();
+    await made.pi.emit("turn_end", {}, made.ctx);
+    return { ...made, ids };
+  }
+
+  test("batched agents start on bb's stuck notifications, and the parent wakes once, when the last finishes, with every result", async () => {
+    const { ids } = await fanOut(3);
+    expect(ids).toEqual(["thr_child1", "thr_child2", "thr_child3"]);
+    expect(callsOf("spawn").map((c) => flag(c.argv, "--parent-notifications"))).toEqual(["stuck", "stuck", "stuck"]);
+    expect(state().queued).toHaveLength(1);
+
+    finish("thr_child1");
+    finish("thr_child2");
+    // The held message's time keeps moving out while an agent runs.
+    await waitFor(() => callsOf("queue").filter((c) => c.argv[2] === "update" && c.argv.includes("--send-at")).length >= 3);
+    expect(wakes()).toEqual([]);
+
+    finish("thr_child3");
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(wakes().map((m) => m.kind)).toEqual(["queued"]);
+    const { text } = wakes()[0];
+    for (const id of ids) expect(text).toContain(`status: completed\nthread: @thread:${id}\n\n${id}'s report`);
+    expect(text).toMatch(/^agentId: thr_child1\ndescription: candidate \d$/m);
+    expect(text).toStartWith("[pstack batch] All 3 agents");
+    expect(state().queued).toEqual([]);
+    await waitFor(batchOver);
+  });
+
+  test("an agent that fails wakes the parent at once, and the batch still reports once the rest finish", async () => {
+    await fanOut(3);
+    bbDoes("__set", "thr_child2", JSON.stringify({ status: "error", output: "crashed" }));
+    expect(wakes()).toEqual([{ threadId: "thr_self", kind: "child-failed", child: "thr_child2" }]);
+
+    await sleep(300);
+    expect(wakes()).toHaveLength(1);
+    finish("thr_child1");
+    finish("thr_child3");
+    await waitFor(() => wakes().length === 2);
+    await sleep(300);
+    expect(wakes().map((m) => m.kind)).toEqual(["child-failed", "queued"]);
+    expect(wakes()[1].text).toContain("status: failed\nthread: @thread:thr_child2\n\ncrashed");
+  });
+
+  test("a tracker that dies mid-batch is started again when the parent's pi starts again, and the batch still wakes it exactly once", async () => {
+    await fanOut(3);
+    await waitFor(() => existsSync(batchDir()) && readdirSync(batchDir()).some((n) => n.endsWith(".pid")));
+    const first = trackerPid();
+    process.kill(first, "SIGKILL");
+    await waitFor(() => !alive(first));
+    finish("thr_child1");
+
+    // bb ended the parent's pi; its next run loads the extension afresh.
+    const pi = fakePi();
+    install(pi.api, { ...w.settings, bb, bbBatch });
+    await pi.emit("session_start", { reason: "resume" }, fakeCtx({ cwd: w.cwd }));
+    const second = trackerPid();
+    expect(second).not.toBe(first);
+    expect(alive(second)).toBe(true);
+
+    finish("thr_child2");
+    finish("thr_child3");
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(wakes().map((m) => m.kind)).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 3 agents");
+    await waitFor(batchOver);
+  });
+
+  test("when no tracker runs, the held message fires on its own, and the next run hands the agents still running back to bb's own notices", async () => {
+    const { pi, ctx } = await fanOut(2);
+    await waitFor(() => existsSync(batchDir()) && readdirSync(batchDir()).some((n) => n.endsWith(".pid")));
+    const pid = trackerPid();
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !alive(pid));
+
+    bbDoes("__fire", "thr_self", state().queued[0].id);
+    expect(wakes().map((m) => m.kind)).toEqual(["queued"]);
+    expect(wakes()[0].text).toContain("Agents of the batch still running now report to you one by one");
+
+    await pi.emit("agent_start", {}, ctx);
+    await waitFor(() => ["thr_child1", "thr_child2"].every((id) => state().threads[id].parentNotifications === "auto"));
+    await waitFor(batchOver);
+    finish("thr_child1");
+    expect(wakes().map((m) => m.kind)).toEqual(["queued", "child-completed"]);
+  });
+
+  test("an agent that ends its turn while its own agents run has not finished", async () => {
+    await fanOut(1);
+    bbDoes("__set", "thr_grandchild", JSON.stringify({ parentThreadId: "thr_child1", status: "active" }));
+    finish("thr_child1", { output: "waiting on my worker" });
+    await sleep(400);
+    expect(wakes()).toEqual([]);
+
+    // bb hands the worker's report to the agent, which starts its last turn.
+    bbDoes("__set", "thr_grandchild", JSON.stringify({ status: "idle" }));
+    bbDoes("__set", "thr_child1", JSON.stringify({ status: "active" }));
+    finish("thr_child1", { output: "the final report" });
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toContain("the final report");
+  });
+
+  test("batch needs run_in_background, and is not offered outside bb", async () => {
+    const { pi, ctx } = setup();
+    const err = await pi.call("agent", { description: "x", prompt: "x", batch: true }, ctx).catch((e) => e);
+    expect(err.message).toContain("batch needs run_in_background");
+    expect(callsOf("spawn")).toEqual([]);
+    expect(Object.keys(pi.tools.get("agent").parameters.properties)).toContain("batch");
+    const { pi: plain } = setupWorld({});
+    expect(Object.keys(plain.tools.get("agent").parameters.properties)).not.toContain("batch");
   });
 });
 

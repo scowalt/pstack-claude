@@ -2,21 +2,51 @@
 // Stands in for the bb CLI (the bb harness points settings.bb.cli at it). It
 // logs each call's argv and stdin to FAKE_BB_LOG and answers from the JSON
 // state in FAKE_BB_STATE: { threads: { <id>: { title, status, parentThreadId,
-// output } }, waitExit, spawnStatus, queued, failing }. A spawn adds a thread
-// with the next id, a tell with --send-at adds a queued message, and a
-// command whose subcommand is `failing` fails as bb does with --json.
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+// output, parentNotifications } }, waitExit, spawnStatus, queued, failing,
+// wakes }. A spawn adds a thread with the next id, a tell with --send-at adds
+// a queued message, and a command whose subcommand is `failing` fails as bb
+// does with --json.
+//
+// wakes lists what bb would have delivered to a thread, in order: a tell, a
+// queued message sent or fired, and a child's outcome its parent-notifications
+// setting reports (auto: completed and failed; stuck: failed). Tests drive bb's
+// side with two subcommands bb does not have: `thread __set <id> <json>`
+// changes a thread, and `thread __fire <threadId> <messageId>` sends a queued
+// message as its scheduled time would.
+//
+// The batch tracker calls this from its own process while the test does, so
+// every call holds a lock over the state, and the state is replaced whole.
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
 
 const [command, sub, ...rest] = process.argv.slice(2);
 const stdin = readFileSync(0, "utf8");
 const statePath = process.env.FAKE_BB_STATE;
+const lock = `${statePath}.lock`;
+for (;;) {
+  try {
+    mkdirSync(lock);
+    break;
+  } catch {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+  }
+}
+process.on("exit", () => rmdirSync(lock));
 const state = JSON.parse(readFileSync(statePath, "utf8"));
 appendFileSync(process.env.FAKE_BB_LOG, `${JSON.stringify({ argv: [command, sub, ...rest], stdin })}\n`);
 
 const opt = (name) => (rest.includes(name) ? rest[rest.indexOf(name) + 1] : undefined);
 const thread = (id) => ({ id, title: null, status: "idle", parentThreadId: null, ...state.threads[id] });
-const save = () => writeFileSync(statePath, JSON.stringify(state));
+const save = () => {
+  writeFileSync(`${statePath}.tmp`, JSON.stringify(state));
+  renameSync(`${statePath}.tmp`, statePath);
+};
 const print = (value) => process.stdout.write(JSON.stringify(value));
+const fail = (message) => {
+  print({ ok: false, error: { message } });
+  process.exit(1);
+};
+const wake = (threadId, kind, extra) => state.wakes.push({ threadId, kind, ...extra });
+const queuedText = (m) => m.content[0].text;
 
 if (command !== "thread") process.exit(3);
 if (state.failing === sub) {
@@ -24,13 +54,20 @@ if (state.failing === sub) {
   process.exit(1);
 }
 state.queued ??= [];
+state.wakes ??= [];
 switch (sub) {
   case "show":
     print({ thread: thread(rest[0]) });
     break;
   case "spawn": {
     const id = `thr_child${Object.keys(state.threads).length}`;
-    state.threads[id] = { title: opt("--title"), status: state.spawnStatus ?? "starting", parentThreadId: "thr_self", output: state.childOutput ?? "done" };
+    state.threads[id] = {
+      title: opt("--title"),
+      status: state.spawnStatus ?? "starting",
+      parentThreadId: "thr_self",
+      output: state.childOutput ?? "done",
+      parentNotifications: opt("--parent-notifications") ?? "auto",
+    };
     save();
     print(thread(id));
     break;
@@ -49,11 +86,27 @@ switch (sub) {
     print({ ok: true });
     break;
   case "update":
+    if (opt("--parent-notifications")) state.threads[rest[0]].parentNotifications = opt("--parent-notifications");
+    save();
     print({ ok: true, delivery: "sent" });
     break;
+  case "__set": {
+    const before = thread(rest[0]);
+    state.threads[rest[0]] = { ...state.threads[rest[0]], ...JSON.parse(rest[1]) };
+    const after = thread(rest[0]);
+    const mode = after.parentNotifications ?? "auto";
+    if (before.status !== after.status && after.parentThreadId) {
+      if (after.status === "error" && mode !== "off") wake(after.parentThreadId, "child-failed", { child: after.id });
+      if (after.status === "idle" && mode === "auto") wake(after.parentThreadId, "child-completed", { child: after.id });
+    }
+    save();
+    break;
+  }
   case "tell": {
     const sendAt = opt("--send-at");
     if (!sendAt) {
+      wake(rest[0], "tell", { text: stdin });
+      save();
       print({ ok: true, delivery: "sent" });
       break;
     }
@@ -64,14 +117,31 @@ switch (sub) {
     print({ ok: true, delivery: "queued", queuedMessage });
     break;
   }
-  case "queue":
-    if (rest[0] === "list") print(state.queued);
-    else if (rest[0] === "delete") {
-      state.queued = state.queued.filter((m) => m.id !== rest[2]);
+  case "__fire":
+  case "queue": {
+    const action = sub === "__fire" ? "send" : rest[0];
+    const [threadId, id] = sub === "__fire" ? rest : rest.slice(1);
+    const message = state.queued.find((m) => m.id === id);
+    if (action === "list") print(state.queued);
+    else if (action === "delete") {
+      state.queued = state.queued.filter((m) => m !== message);
       save();
       print({ ok: true });
+    } else if (action === "update") {
+      if (!message) fail("HTTP 404: Queued message not found");
+      if (rest.includes("--message-file")) message.content = [{ type: "text", text: stdin }];
+      if (opt("--send-at")) message.sendAt = Date.now() + Number.parseInt(opt("--send-at"), 10) * 1000;
+      save();
+      print(message);
+    } else if (action === "send") {
+      if (!message) fail("HTTP 404: Queued message not found");
+      state.queued = state.queued.filter((m) => m !== message);
+      wake(threadId, "queued", { text: queuedText(message) });
+      save();
+      print({ ok: true, delivery: "sent" });
     } else process.exit(3);
     break;
+  }
   default:
     process.exit(3);
 }

@@ -46,6 +46,8 @@ export interface Settings {
   exitGraceMs: number;
   // Set when pi runs as a bb thread: the agent tools then start bb child threads.
   bb?: BbEnv;
+  // How often a bb batch's tracker looks, and how far out it keeps the batch's held message. Tests shorten it.
+  bbBatch?: { pollMs: number; heartbeatMs: number; deadlineS: number };
 }
 
 // Pi re-runs itself for children when it can: the same runtime and CLI script,

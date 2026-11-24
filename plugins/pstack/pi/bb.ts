@@ -1,15 +1,17 @@
 // Subagents as bb child threads. Inside a bb thread, bb already runs, shows,
 // steers, and reports on child threads, so the agent tools start one of those
 // instead of a pi process the bb app cannot see.
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { truncateUtf8, OUTPUT_CAP_BYTES } from "./agent-text.ts";
 import { agentParams, type AgentParams } from "./agent-tools.ts";
 import { loadAgentTypes } from "./agent-files.ts";
 import { fromAgentFile } from "./agents.ts";
-import { type BbEnv, checkEffort, GENERAL_PURPOSE, readSheet, resolveModel, type Settings } from "./config.ts";
+import { Batches, DEFAULT_TIMING } from "./bb-batch.mjs";
+import { BbCli, failure, RUNNING, resultText } from "./bb-cli.mjs";
+import { type BbEnv, checkEffort, GENERAL_PURPOSE, PSTACK_STATE_DIR, readSheet, resolveModel, type Settings } from "./config.ts";
 
 // As for pi children: three layers below the main session, and none from the third.
 const MAX_SPAWN_DEPTH = 3;
@@ -17,52 +19,12 @@ const MAX_SPAWN_DEPTH = 3;
 const WAIT_SLICE = "1h";
 const WAIT_TIMED_OUT = 2;
 const WAIT_THREAD_ERROR = 4;
-const RUNNING = new Set(["pending", "starting", "active", "stopping"]);
 
 interface BbThread {
   id: string;
   title: string | null;
   status: string;
   parentThreadId: string | null;
-}
-
-interface Run {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-// With --json, bb prints {"ok": false, "error": {message, hint}} on a failure.
-function failure(args: string[], r: Run): Error {
-  try {
-    const { message, hint } = JSON.parse(r.stdout).error;
-    if (message) return new Error(`bb ${args.slice(0, 2).join(" ")}: ${message}${hint ? ` (${hint})` : ""}`);
-  } catch {}
-  return new Error(`bb ${args.slice(0, 2).join(" ")} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 1000)}`);
-}
-
-export class BbCli {
-  constructor(private readonly cli: string) {}
-
-  run(args: string[], { input, signal }: { input?: string; signal?: AbortSignal } = {}): Promise<Run> {
-    return new Promise((resolve, reject) => {
-      const child = spawn(this.cli, args, { stdio: ["pipe", "pipe", "pipe"], signal });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.setEncoding("utf8").on("data", (d) => (stdout += d));
-      child.stderr.setEncoding("utf8").on("data", (d) => (stderr += d));
-      child.on("error", reject);
-      child.on("close", (code) => resolve({ code, stdout, stderr }));
-      child.stdin.on("error", () => {});
-      child.stdin.end(input ?? "");
-    });
-  }
-
-  async json<T>(args: string[], input?: string): Promise<T> {
-    const r = await this.run([...args, "--json"], { input });
-    if (r.code !== 0) throw failure(args, r);
-    return JSON.parse(r.stdout) as T;
-  }
 }
 
 // A worktree agent starts from the commit the parent has checked out, as a
@@ -84,6 +46,7 @@ function childPrompt(params: AgentParams, type: string, body: string, parent: st
 
 export class BbAgents {
   private readonly cli: BbCli;
+  readonly batches: Batches;
   // What bb does not keep about a child: the subagent type it was started as.
   private readonly types = new Map<string, string>();
   private depth?: Promise<number>;
@@ -94,6 +57,12 @@ export class BbAgents {
     readonly env: BbEnv,
   ) {
     this.cli = new BbCli(env.cli);
+    this.batches = new Batches({
+      cli: env.cli,
+      threadId: env.threadId,
+      dir: join(settings.agentDir, PSTACK_STATE_DIR, "bb-batches", env.threadId),
+      timing: settings.bbBatch ?? DEFAULT_TIMING,
+    });
   }
 
   // Layers of bb parent threads above this one, counted up to the limit.
@@ -140,9 +109,11 @@ export class BbAgents {
     })();
 
     const background = params.run_in_background === true;
+    if (params.batch && !background) throw new Error("batch needs run_in_background: a foreground agent's result is already its own report.");
     const args = ["thread", "spawn", "--project", this.env.projectId, "--parent-self", "--title", params.description, "--prompt-file", "-", "--provider", "pi"];
     // A foreground call returns the result itself, so bb's report would arrive twice.
-    args.push("--parent-notifications", background ? "auto" : "off");
+    // A batch member's finished turn reports through its batch instead.
+    args.push("--parent-notifications", params.batch ? "stuck" : background ? "auto" : "off");
     if (model) args.push("--model", model);
     if (level) args.push("--reasoning-level", level);
     if (params.isolation === "worktree") {
@@ -152,9 +123,11 @@ export class BbAgents {
     } else {
       args.push("--environment", this.env.environmentId);
     }
-    const thread = await this.cli.json<BbThread>(args, childPrompt(params, type, def.body, this.env.threadId, depth + 1 >= MAX_SPAWN_DEPTH));
-    this.types.set(thread.id, type);
-    return thread.id;
+    const prompt = childPrompt(params, type, def.body, this.env.threadId, depth + 1 >= MAX_SPAWN_DEPTH);
+    const spawnThread = async () => (await this.cli.json<BbThread>(args, prompt)).id;
+    const id = params.batch ? await this.batches.join(spawnThread) : await spawnThread();
+    this.types.set(id, type);
+    return id;
   }
 
   // Waits for the thread to go idle, then reads its final reply. An abort stops the thread.
@@ -223,15 +196,19 @@ export class BbAgents {
 const BACKGROUND_NOTE =
   "The agent is working in the background as a bb child thread. bb reports to this thread automatically when it finishes. You know nothing about its results until that report arrives — do not report, assume, or predict them, and do not poll it with bb thread wait or sleep; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.";
 
-function resultText(id: string, description: string, { status, output }: { status: string; output: string }): string {
-  const capped = truncateUtf8(output, OUTPUT_CAP_BYTES);
-  const tail = capped === output ? "" : `\n\n[Output truncated at ${OUTPUT_CAP_BYTES / 1024} KB. Full output: bb thread output ${id}]`;
-  return `agentId: ${id}\ndescription: ${description}\nstatus: ${status}\nthread: @thread:${id}\n\n${capped}${tail}`;
-}
+const BATCH_NOTE =
+  "The agent is working in the background as a bb child thread, in a batch with the other agents this response starts with batch: true. Once the last of them finishes, one message brings all of their results; an agent that fails, or stops on an approval or a question, reports at once. You know nothing about their results until then — do not report, assume, or predict them, and do not poll them with bb thread wait or sleep; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.";
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }] });
 
 export function registerBbAgentTools(pi: ExtensionAPI, agents: BbAgents, settings: Settings): void {
+  // A response's tool calls have all run by its turn_end, so its batch is complete.
+  pi.on("turn_end", () => agents.batches.seal());
+  const ensure = (_event: unknown, ctx: ExtensionContext) =>
+    agents.batches.ensure().catch((e: unknown) => ctx.ui.notify(`pstack could not check this thread's agent batches: ${e instanceof Error ? e.message : String(e)}`, "error"));
+  pi.on("session_start", ensure);
+  pi.on("agent_start", ensure);
+
   pi.registerCommand("pstack-agents", {
     description: "Show each bb child thread this thread started, with its status",
     async handler(_args, ctx) {
@@ -245,13 +222,13 @@ export function registerBbAgentTools(pi: ExtensionAPI, agents: BbAgents, setting
     label: "Agent",
     exposure: "model-only",
     description:
-      "Launch a subagent as a bb child thread of this thread, visible in the bb app. Foreground (default) waits and returns its final reply; run_in_background returns its thread id at once, and bb reports to this thread when it finishes. Use send_message to steer a running agent or continue a finished one, stop_agent to stop one, list_agents to see them.",
+      "Launch a subagent as a bb child thread of this thread, visible in the bb app. Foreground (default) waits and returns its final reply; run_in_background returns its thread id at once, and bb reports to this thread when it finishes. Pass batch: true on each background agent of a fan-out to get one report when the last finishes, not one per agent. Use send_message to steer a running agent or continue a finished one, stop_agent to stop one, list_agents to see them.",
     promptSnippet: "Launch a subagent as a bb child thread (foreground or background, optional worktree)",
-    parameters: agentParams(loadAgentTypes(settings)),
+    parameters: agentParams(loadAgentTypes(settings), { batch: true }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const id = await agents.start(params, ctx);
       if (params.run_in_background) {
-        return { ...text(`${JSON.stringify({ agentId: id, status: "running", thread: `@thread:${id}` })}\n\n${BACKGROUND_NOTE}`), details: { agentId: id, status: "running" } };
+        return { ...text(`${JSON.stringify({ agentId: id, status: "running", thread: `@thread:${id}` })}\n\n${params.batch ? BATCH_NOTE : BACKGROUND_NOTE}`), details: { agentId: id, status: "running" } };
       }
       const result = await agents.result(id, signal);
       return { ...text(resultText(id, params.description, result)), details: { agentId: id, status: result.status }, isError: result.status !== "completed" };

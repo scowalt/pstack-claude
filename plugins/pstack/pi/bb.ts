@@ -168,10 +168,15 @@ export class BbAgents {
 
   // The reply to a message comes back the way a background agent's does, so
   // a child started in the foreground starts reporting to its parent here.
-  async send(to: string, message: string): Promise<{ id: string; running: boolean }> {
+  // A batch member's turn reports through its batch, as a batched agent's first turn does.
+  async send(to: string, message: string, batch = false): Promise<{ id: string; running: boolean }> {
     const thread = await this.find(to);
-    await this.cli.json(["thread", "update", thread.id, "--parent-notifications", "auto"]);
-    await this.cli.json(["thread", "tell", thread.id, "--mode", "auto", "--message-file", "-"], message);
+    const tell = async () => {
+      await this.cli.json(["thread", "update", thread.id, "--parent-notifications", batch ? "stuck" : "auto"]);
+      await this.cli.json(["thread", "tell", thread.id, "--mode", "auto", "--message-file", "-"], message);
+      return thread.id;
+    };
+    await (batch ? this.batches.join(tell) : tell());
     return { id: thread.id, running: RUNNING.has(thread.status) };
   }
 
@@ -197,7 +202,7 @@ const BACKGROUND_NOTE =
   "The agent is working in the background as a bb child thread. bb reports to this thread automatically when it finishes. You know nothing about its results until that report arrives — do not report, assume, or predict them, and do not poll it with bb thread wait or sleep; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.";
 
 const BATCH_NOTE =
-  "The agent is working in the background as a bb child thread, in a batch with the other agents this response starts with batch: true. Once the last of them finishes, one message brings all of their results, or the finished ones' results and where the rest stand if others still run 30 minutes after the first finished or 2 hours after they started; an agent that fails, or stops on an approval or a question, reports at once. You know nothing about their results until then — do not report, assume, or predict them, and do not poll them with bb thread wait or sleep; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.";
+  "The agent is working in the background as a bb child thread, in a batch with the other agents this response starts or messages with batch: true. Once the last of them finishes, one message brings all of their results, or the finished ones' results and where the rest stand if others still run 30 minutes after the first finished or 2 hours after they started; an agent that fails, or stops on an approval or a question, reports at once. You know nothing about their results until then — do not report, assume, or predict them, and do not poll them with bb thread wait or sleep; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.";
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }] });
 
@@ -240,14 +245,23 @@ export function registerBbAgentTools(pi: ExtensionAPI, agents: BbAgents, setting
     label: "Send message",
     exposure: "model-only",
     description:
-      "Send a message to a child thread this thread started, by agentId (its thread id) or description (its title). A running agent reads it in its current turn; a finished one starts a new turn with its earlier context. Either way bb reports to this thread when that turn ends.",
+      "Send a message to a child thread this thread started, by agentId (its thread id) or description (its title). A running agent reads it in its current turn; a finished one starts a new turn with its earlier context. Either way bb reports to this thread when that turn ends. Pass batch: true on each message of a follow-up to several agents to get one report when the last finishes, not one per agent.",
     parameters: Type.Object(
-      { to: Type.String({ description: "agentId or the agent's description" }), message: Type.String({ description: "The message to send" }) },
+      {
+        to: Type.String({ description: "agentId or the agent's description" }),
+        message: Type.String({ description: "The message to send" }),
+        batch: Type.Optional(
+          Type.Boolean({
+            description:
+              "Report the turn this message starts together with every other agent this response starts or messages with batch: true. bb wakes this thread once, when the last of them finishes, with all of their replies. An agent that fails, or stops on an approval or a question, still wakes it at once.",
+          }),
+        ),
+      },
       { additionalProperties: false },
     ),
     async execute(_id, params) {
-      const { id, running } = await agents.send(params.to, params.message);
-      return { ...text(JSON.stringify({ agentId: id, status: "running", steered: running })), details: { agentId: id, running } };
+      const { id, running } = await agents.send(params.to, params.message, params.batch === true);
+      return { ...text(`${JSON.stringify({ agentId: id, status: "running", steered: running })}${params.batch ? `\n\n${BATCH_NOTE}` : ""}`), details: { agentId: id, running } };
     },
   });
 

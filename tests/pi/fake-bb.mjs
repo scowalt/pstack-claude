@@ -132,6 +132,9 @@ switch (sub) {
     const sendAt = opt("--send-at");
     if (!sendAt) {
       wake(rest[0], "tell", { text: stdin });
+      // bb starts an idle child's next turn at once.
+      const target = state.threads[rest[0]];
+      if (target?.parentThreadId && (target.status ?? "idle") === "idle") target.status = "pending";
       save();
       print({ ok: true, delivery: "sent" });
       break;

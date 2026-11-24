@@ -1,4 +1,4 @@
-// A batch: the background agents one response starts with batch: true. Each
+// A batch: the background agents one response starts or messages with batch: true. Each
 // starts on bb's stuck parent notifications, so a failure or a question still
 // wakes the parent at once and a finished turn does not. The parent's wake for
 // the batch is one message bb holds in the parent's queue, scheduled a few
@@ -105,7 +105,7 @@ export class Batches {
     const path = await this.current;
     const id = await start();
     try {
-      await this.update(path, (record) => record.members.push(id));
+      await this.update(path, (record) => record.members.includes(id) || record.members.push(id));
     } catch (e) {
       await this.bb.json(["thread", "update", id, "--parent-notifications", "auto"]).catch(() => {
         throw new Error(`Started ${id}, but neither recorded it in its batch nor switched it to report on its own: ${e instanceof Error ? e.message : e}`);
@@ -230,8 +230,8 @@ async function report(bb, members, done, stopped) {
   const count = done.filter(Boolean).length;
   const head =
     count === members.length
-      ? `[pstack batch] All ${members.length} agents this thread started together in one response have finished. bb held each one's own report until the last finished, so here are all of them.`
-      : `[pstack batch] ${count} of the ${members.length} agents this thread started together in one response have finished. The batch stopped waiting for the rest ${stopped}, so here is where each one stands. The others report to you one by one as they finish.`;
+      ? `[pstack batch] All ${members.length} agents this thread started or messaged together in one response have finished. bb held each one's own report until the last finished, so here are all of them.`
+      : `[pstack batch] ${count} of the ${members.length} agents this thread started or messaged together in one response have finished. The batch stopped waiting for the rest ${stopped}, so here is where each one stands. The others report to you one by one as they finish.`;
   return `${head}\n\n${parts.join("\n\n---\n\n")}\n\n${FROM_PSTACK}`;
 }
 

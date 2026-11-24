@@ -560,6 +560,51 @@ describe("batch", () => {
     await waitFor(() => !alive(first));
   });
 
+  // thr_mbcww4fgy5, Nov 24: 39 send_message calls in one response, each a recount for an auditor that had
+  // finished, woke the parent 29 times as the replies came back, most turns only to say who was left.
+  test("send_message with batch: true continues finished agents on stuck notifications, and the parent wakes once, when the last finishes, with every reply", async () => {
+    const done = (title) => ({ title, status: "idle", parentThreadId: "thr_self", parentNotifications: "auto", output: "first pass" });
+    const { pi, ctx } = setup({ threads: { thr_self: { status: "active" }, thr_a: done("auditor a"), thr_b: done("auditor b"), thr_c: done("auditor c") } });
+    const sent = await Promise.all(["thr_a", "thr_b", "thr_c"].map((to) => pi.call("send_message", { to, message: "recount", batch: true }, ctx)));
+    expect(sent.map((r) => r.details.agentId)).toEqual(["thr_a", "thr_b", "thr_c"]);
+    expect(resultText(sent[0])).toContain("in a batch");
+    await pi.emit("turn_end", {}, ctx);
+    expect(callsOf("update").map((c) => [c.argv[2], flag(c.argv, "--parent-notifications")]).sort()).toEqual([
+      ["thr_a", "stuck"],
+      ["thr_b", "stuck"],
+      ["thr_c", "stuck"],
+    ]);
+    expect(callsOf("tell").filter((c) => c.argv[2] !== "thr_self").map((c) => c.stdin)).toEqual(["recount", "recount", "recount"]);
+
+    finish("thr_a", { output: "a: 30 -> 35" });
+    finish("thr_b", { output: "b: 40 -> 41" });
+    await sleep(300);
+    expect(wakes()).toEqual([]);
+
+    finish("thr_c", { output: "c: null -> 24" });
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(kinds()).toEqual(["queued"]);
+    const { text } = wakes()[0];
+    expect(text).toStartWith("[pstack batch] All 3 agents");
+    for (const r of ["a: 30 -> 35", "b: 40 -> 41", "c: null -> 24"]) expect(text).toContain(r);
+    await waitFor(batchOver);
+    expect(["thr_a", "thr_b", "thr_c"].map((id) => state().threads[id].parentNotifications)).toEqual(["auto", "auto", "auto"]);
+  });
+
+  test("send_message to the same agent twice in one response records it in the batch once", async () => {
+    const { pi, ctx } = setup({ threads: { thr_self: { status: "active" }, thr_a: { title: "a", status: "idle", parentThreadId: "thr_self" } } });
+    await pi.call("send_message", { to: "thr_a", message: "one", batch: true }, ctx);
+    await pi.call("send_message", { to: "thr_a", message: "two", batch: true }, ctx);
+    await pi.emit("turn_end", {}, ctx);
+    const record = JSON.parse(readFileSync(join(batchDir(), readdirSync(batchDir()).find((n) => n.endsWith(".json") && !n.includes("tracker"))), "utf8"));
+    expect(record.members).toEqual(["thr_a"]);
+    finish("thr_a");
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 1 agents");
+    await waitFor(batchOver);
+  });
+
   test("batch needs run_in_background, and is not offered outside bb", async () => {
     const { pi, ctx } = setup();
     const err = await pi.call("agent", { description: "x", prompt: "x", batch: true }, ctx).catch((e) => e);

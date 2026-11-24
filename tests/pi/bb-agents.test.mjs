@@ -20,6 +20,7 @@ beforeEach(() => (saved = { ...process.env }));
 // the bb calls it is making, while its world still exists. A tracker's argv
 // holds its record's path, under this test's own temporary world.
 afterEach(() => {
+  process.env = saved;
   if (w) {
     const root = dirname(w.agentDir);
     const found = spawnSync("pgrep", ["-f", `bb-batch\\.mjs ${root}/`], { encoding: "utf8" }).stdout;
@@ -31,7 +32,6 @@ afterEach(() => {
       }
     }
   }
-  process.env = saved;
 });
 const setupWorld = useWorld();
 
@@ -211,6 +211,42 @@ describe("batch", () => {
     await sleep(300);
     expect(wakes().map((m) => m.kind)).toEqual(["queued"]);
     expect(wakes()[0].text).toStartWith("[pstack batch] All 3 agents");
+    await waitFor(batchOver);
+  });
+
+  const cgroupOf = (pid) => readFileSync(`/proc/${pid}/cgroup`, "utf8");
+  const scopes = spawnSync("systemd-run", ["--user", "--scope", "--collect", "--quiet", "true"]).status === 0;
+
+  // bb's service stops every process in its cgroup when it restarts, and pi runs in that cgroup.
+  test.skipIf(!scopes)("a tracker runs outside the cgroup of the pi that started it, so a restart of bb does not stop it", async () => {
+    await fanOut(2);
+    await waitFor(hasTracker);
+    const pid = trackerPid();
+    await waitFor(() => readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("bb-batch.mjs"));
+    expect(cgroupOf(pid)).not.toBe(cgroupOf(process.pid));
+    expect(cgroupOf(pid)).toMatch(/\.scope\n$/);
+
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    await waitFor(() => !alive(pid));
+    await waitFor(batchOver);
+  });
+
+  test.skipIf(process.platform !== "linux")("without systemd's user manager the tracker is a plain detached process, and the batch still reports", async () => {
+    // Only node's own directory, so systemd-run is not found.
+    process.env.PATH = dirname(spawnSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).stdout.trim());
+    await fanOut(2);
+    await waitFor(hasTracker);
+    const pid = trackerPid();
+    expect(cgroupOf(pid)).toBe(cgroupOf(process.pid));
+
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => wakes().length > 0);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    await waitFor(() => !alive(pid));
     await waitFor(batchOver);
   });
 

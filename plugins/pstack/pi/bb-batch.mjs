@@ -9,13 +9,15 @@
 // a held message at most once, so a second tracker or the scheduled time firing
 // cannot wake the parent twice. A tracker that dies stops pushing the time
 // back, so the message fires on its own, and the tracker the parent's next run
-// starts hands the agents back.
+// starts hands the agents back. The tracker runs in a systemd scope of its own
+// where there is one, since bb's service stops every process in its cgroup each
+// time it restarts.
 //
 // The parent alone writes a batch's record; each tracker writes only its lease
 // file beside it, with its pid and the time it last reached bb.
 //
 // Plain JavaScript, so node runs the tracker on its own: node bb-batch.mjs <record>.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -39,6 +41,11 @@ const FALLBACK =
   `\n\n${FROM_PSTACK}`;
 
 const STATUS = { idle: "completed", error: "failed" };
+
+// systemd's user manager starts a command in a new scope and then runs it in
+// place, so the tracker keeps the pid it was started with.
+const SCOPE = ["--user", "--scope", "--collect", "--quiet", "--description=pstack batch tracker"];
+const hasScopes = () => spawnSync("systemd-run", [...SCOPE, "true"], { stdio: "ignore", timeout: 5000 }).status === 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -164,8 +171,11 @@ export class Batches {
   }
 
   // The new lease names the new tracker, so a stale one still running sees it and exits.
+  // Without systemd's user manager (macOS, no user bus) it is a plain detached process.
   track(path) {
-    const child = spawn(process.execPath, [TRACKER, path], { detached: true, stdio: "ignore" });
+    const argv = [process.execPath, TRACKER, path];
+    const [command, ...args] = hasScopes() ? ["systemd-run", ...SCOPE, ...argv] : argv;
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
     child.unref();
     writeJson(`${path}.tracker`, { pid: child.pid, beat: Date.now() });
   }

@@ -15,7 +15,8 @@
 // side with subcommands bb does not have: `thread __set <id> <json>` changes a
 // thread, `thread __fire <threadId> <messageId>` sends a queued message as its
 // scheduled time would, `thread __queue <threadId> <json>` adds a row to a
-// thread's queue, and `thread __state <json>` changes the top-level state.
+// thread's queue, `thread __delete <id>` deletes a thread, after which bb
+// answers 404 for it, and `thread __state <json>` changes the top-level state.
 //
 // The batch tracker calls this from its own process while the test does, so
 // every call holds a lock over the state, and the state is replaced whole.
@@ -48,8 +49,8 @@ const save = () => {
   renameSync(`${statePath}.tmp`, statePath);
 };
 const print = (value) => process.stdout.write(JSON.stringify(value));
-const fail = (message) => {
-  print({ ok: false, error: { message } });
+const fail = (message, code) => {
+  print({ ok: false, error: { code, message } });
   process.exit(1);
 };
 const wake = (threadId, kind, extra) => state.wakes.push({ threadId, kind, ...extra });
@@ -62,6 +63,13 @@ if (state.failing === sub || state.failFor?.includes(process.ppid)) {
 }
 state.queued ??= [];
 state.wakes ??= [];
+if (state.deleted?.includes(sub === "queue" ? rest[1] : rest[0])) fail("HTTP 404: Thread not found", "thread_not_found");
+// As bb counts it: a failed row, else a row that is not bb's own notice.
+const queuedWork = (id) => {
+  const rows = state.queued.filter((m) => m.threadId === id);
+  if (rows.some((m) => m.state?.startsWith("failed"))) return "failed";
+  return rows.some((m) => !m.systemNotice) ? "waiting" : "none";
+};
 const due = state.queued.filter((m) => m.sendAt && m.sendAt <= Date.now());
 for (const m of due) wake(m.threadId, "queued", { text: queuedText(m) });
 if (due.length) {
@@ -91,7 +99,12 @@ switch (sub) {
     print({ output: thread(rest[0]).output ?? null });
     break;
   case "list":
-    print(Object.keys(state.threads).map(thread).filter((t) => t.parentThreadId === opt("--parent-thread")));
+    print(
+      Object.keys(state.threads)
+        .map(thread)
+        .filter((t) => t.parentThreadId === opt("--parent-thread"))
+        .map((t) => ({ ...t, queuedWork: queuedWork(t.id) })),
+    );
     break;
   case "stop":
     state.threads[rest[0]].status = "idle";
@@ -133,6 +146,11 @@ switch (sub) {
   case "__queue":
     state.queuedCount = (state.queuedCount ?? 0) + 1;
     state.queued.push({ id: `qmsg_${state.queuedCount}`, threadId: rest[0], state: "scheduled", waitingOn: { kind: "time" }, content: [{ type: "text", text: "Please continue." }], ...JSON.parse(rest[1]) });
+    save();
+    break;
+  case "__delete":
+    delete state.threads[rest[0]];
+    (state.deleted ??= []).push(rest[0]);
     save();
     break;
   case "__state":

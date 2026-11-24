@@ -200,12 +200,14 @@ async function delivered(bb, { parent, row }) {
 const pending = (m) => m.state !== "failed_exhausted" && m.waitingOn?.kind !== "superseded";
 
 // An agent has finished when it is not running, bb holds nothing it will send
-// it, and none of its own agents still run.
+// it, and none of its own agents still run. bb's children list already says
+// whether a thread's queue holds anything: "none" leaves only bb's own notices,
+// which it sends within 2 s, before the second of the two looks.
 async function finished(bb, member) {
   if (member.status === "deleted") return true;
   if (RUNNING.has(member.status)) return false;
   const [queued, children] = await Promise.all([
-    bb.json(["thread", "queue", "list", member.id]),
+    member.queuedWork === "none" ? [] : bb.json(["thread", "queue", "list", member.id]),
     bb.json(["thread", "list", "--parent-thread", member.id, "--include-hidden"]),
   ]);
   return !queued.some(pending) && !children.some((c) => RUNNING.has(c.status));
@@ -241,17 +243,27 @@ async function handBack(bb, members) {
 
 // One look at the batch. Returns true once the batch is over and every agent
 // is back on bb's usual notices. look holds what earlier looks found.
-async function step(bb, record, look) {
+async function step(bb, path, look) {
+  let record = readJson(path);
   const { parent, row, timing } = record;
   // A tracker replacing one that died may find the batch already reported.
   look.over ??= await delivered(bb, record);
+  // A batch whose parent's run ended without sealing it has every member it
+  // will get. Read again once the parent is seen stopped, so it holds all of them.
+  const sealed = record.sealed || !RUNNING.has((await bb.json(["thread", "show", parent])).thread.status);
+  if (sealed) record = readJson(path);
   const children = await bb.json(["thread", "list", "--parent-thread", parent, "--include-hidden"]);
   const members = record.members.map((id) => children.find((c) => c.id === id) ?? { id, title: null, status: "deleted" });
-  if (look.over) return (await handBack(bb, members)) && record.sealed;
+  if (look.over) return (await handBack(bb, members)) && sealed;
 
-  // A batch whose parent's run ended without sealing it has every member it will get.
-  const sealed = record.sealed || !RUNNING.has((await bb.json(["thread", "show", parent])).thread.status);
   if (sealed) {
+    // The parent's run ended before it recorded an agent, so there is nothing to report.
+    if (members.length === 0) {
+      await bb.json(["thread", "queue", "delete", parent, row]).catch(async (e) => {
+        if (!(await delivered(bb, record))) throw e;
+      });
+      return true;
+    }
     const done = await Promise.all(members.map((m) => finished(bb, m)));
     const all = done.every(Boolean);
     if (done.some(Boolean)) look.firstDone ??= Date.now();
@@ -288,8 +300,18 @@ async function step(bb, record, look) {
   return false;
 }
 
+async function parentGone(bb, parent) {
+  const r = await bb.run(["thread", "show", parent, "--json"]).catch(() => ({ code: 1, stdout: "" }));
+  try {
+    return r.code !== 0 && JSON.parse(r.stdout).error?.code === "thread_not_found";
+  } catch {
+    return false;
+  }
+}
+
 export async function track(path) {
   const look = { allDone: false, nextBeat: 0, firstDone: undefined, over: undefined };
+  let reached = Date.now();
   let bb;
   for (;;) {
     let record;
@@ -303,9 +325,14 @@ export async function track(path) {
     if ((readLease(path)?.pid ?? process.pid) !== process.pid) return;
     bb ??= new BbCli(record.cli, { timeoutMs: TRACKER_CALL_TIMEOUT_MS });
     try {
-      if (await step(bb, record, look)) break;
-      writeJson(`${path}.tracker`, { pid: process.pid, beat: Date.now() });
+      if (await step(bb, path, look)) break;
+      reached = Date.now();
+      writeJson(`${path}.tracker`, { pid: process.pid, beat: reached });
     } catch {
+      // Nobody is left to report to.
+      if (await parentGone(bb, record.parent)) break;
+      // bb has not answered for as long as a batch stays open: the record stays for the tracker the parent's next run starts.
+      if (Date.now() - reached >= record.timing.maxMs) return;
       // bb did not answer; look again next poll. The held message still fires if this never recovers.
       look.allDone = false;
     }

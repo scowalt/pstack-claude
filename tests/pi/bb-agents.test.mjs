@@ -400,6 +400,69 @@ describe("batch", () => {
     await waitFor(() => wakes().length > 0);
     expect(kinds()).toEqual(["queued"]);
     expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    // No run of the parent's will seal it, so the tracker ends on its own.
+    await waitFor(batchOver);
+  });
+
+  test("a parent whose run ended before it recorded an agent gets no report, and its held message is withdrawn", async () => {
+    setup({ threads: { thr_self: { status: "active" } } });
+    const { Batches } = await import("../../plugins/pstack/pi/bb-batch.mjs");
+    const batches = new Batches({ cli: fakeBb, threadId: "thr_self", dir: batchDir(), timing: bbBatch });
+    // pi dies while the first agent starts.
+    const died = await batches
+      .join(async () => {
+        bbDoes("__set", "thr_self", JSON.stringify({ status: "error" }));
+        throw new Error("pi died");
+      })
+      .catch((e) => e);
+    expect(died.message).toBe("pi died");
+    await waitFor(batchOver);
+    await sleep(200);
+    expect(wakes()).toEqual([]);
+    expect(state().queued).toEqual([]);
+  });
+
+  test("a tracker whose parent thread was deleted stops", async () => {
+    await fanOut(2);
+    await waitFor(hasTracker);
+    const pid = trackerPid();
+    bbDoes("__delete", "thr_self");
+    await waitFor(() => !alive(pid));
+    await waitFor(batchOver);
+  });
+
+  test("a tracker that cannot reach bb for as long as a batch stays open gives up, and the parent's next run starts another", async () => {
+    const { pi, ctx } = await fanOut(2, { timing: { maxMs: 1000 } });
+    await waitFor(hasTracker);
+    const first = trackerPid();
+    bbDoes("__state", JSON.stringify({ failFor: [first] }));
+    await waitFor(() => !alive(first));
+    expect(batchOver()).toBe(false);
+    expect(wakes()).toEqual([]);
+
+    finish("thr_child1");
+    finish("thr_child2");
+    await pi.emit("agent_start", {}, ctx);
+    expect(trackerPid()).not.toBe(first);
+    await waitFor(() => wakes().length > 0);
+    expect(kinds()).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    await waitFor(batchOver);
+  });
+
+  test("a finished agent bb's thread list shows with an empty queue costs no queue lookup", async () => {
+    await fanOut(3);
+    finish("thr_child1");
+    finish("thr_child2");
+    await waitFor(() => callsOf("list").length >= 10);
+    const lookups = callsOf("queue").filter((c) => c.argv[2] === "list").map((c) => c.argv[3]);
+    expect(lookups.filter((id) => id !== "thr_self")).toEqual([]);
+    // A row bb will send it still holds it, as before.
+    bbDoes("__queue", "thr_child1", JSON.stringify({ sendAt: Date.now() + 3_600_000 }));
+    finish("thr_child3");
+    await sleep(400);
+    expect(wakes()).toEqual([]);
+    expect(callsOf("queue").some((c) => c.argv[2] === "list" && c.argv[3] === "thr_child1")).toBe(true);
   });
 
   test("an agent its batch failed to record reports on its own, and later batches still record theirs", async () => {

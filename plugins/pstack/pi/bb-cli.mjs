@@ -6,8 +6,9 @@ import { OUTPUT_CAP_BYTES, truncateUtf8 } from "./text-cap.mjs";
 
 export const RUNNING = new Set(["pending", "starting", "active", "stopping"]);
 
-// A bb call that hangs would otherwise hold the detached batch tracker forever.
-export const CALL_TIMEOUT_MS = 60_000;
+// The detached batch tracker kills a bb call after this long, so one that hangs can't hold it forever.
+// The extension's own calls have no limit: `bb thread wait` runs for up to an hour.
+export const TRACKER_CALL_TIMEOUT_MS = 60_000;
 
 // With --json, bb prints {"ok": false, "error": {message, hint}} on a failure.
 export function failure(args, r) {
@@ -19,14 +20,15 @@ export function failure(args, r) {
 }
 
 export class BbCli {
-  constructor(cli) {
+  constructor(cli, { timeoutMs } = {}) {
     this.cli = cli;
+    this.timeoutMs = timeoutMs;
   }
 
-  run(args, { input, signal, timeoutMs = CALL_TIMEOUT_MS } = {}) {
+  run(args, { input, signal, timeoutMs = this.timeoutMs } = {}) {
     return new Promise((resolve, reject) => {
       const child = spawn(this.cli, args, { stdio: ["pipe", "pipe", "pipe"], signal });
-      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      const timer = timeoutMs ? setTimeout(() => child.kill("SIGKILL"), timeoutMs) : undefined;
       let stdout = "";
       let stderr = "";
       child.stdout.setEncoding("utf8").on("data", (d) => (stdout += d));

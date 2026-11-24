@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { BbCli, RUNNING, resultText } from "./bb-cli.mjs";
+import { BbCli, RUNNING, TRACKER_CALL_TIMEOUT_MS, resultText } from "./bb-cli.mjs";
 
 export const DEFAULT_TIMING = { pollMs: 5000, heartbeatMs: 120_000, deadlineS: 600 };
 
@@ -204,7 +204,7 @@ async function step(bb, record, look) {
 
 export async function track(path) {
   const record = JSON.parse(readFileSync(path, "utf8"));
-  const bb = new BbCli(record.cli);
+  const bb = new BbCli(record.cli, { timeoutMs: TRACKER_CALL_TIMEOUT_MS });
   const look = { finished: false, nextBeat: 0 };
   // Another tracker that closed the batch removed the record.
   while (existsSync(path)) {

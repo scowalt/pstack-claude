@@ -44,9 +44,16 @@ describe("bb CLI", () => {
   test("a bb call that hangs is killed, so a detached tracker never waits on it forever", async () => {
     const { BbCli } = await import("../../plugins/pstack/pi/bb-cli.mjs");
     const started = Date.now();
-    const r = await new BbCli("sleep").run(["30"], { timeoutMs: 200 });
+    const r = await new BbCli("sleep", { timeoutMs: 200 }).run(["30"]);
     expect(r.code).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  test("the extension's own bb calls have no limit, so a long bb thread wait is not killed", async () => {
+    const { BbCli } = await import("../../plugins/pstack/pi/bb-cli.mjs");
+    const r = await new BbCli("sleep").run(["0.3"]);
+    expect(r.code).toBe(0);
+    expect(new BbCli("sleep").timeoutMs).toBeUndefined();
   });
 });
 

@@ -4,6 +4,7 @@ export interface BatchTiming {
   deadlineS: number;
   staleMs: number;
   boundMs: number;
+  maxMs: number;
 }
 
 export const DEFAULT_TIMING: BatchTiming;

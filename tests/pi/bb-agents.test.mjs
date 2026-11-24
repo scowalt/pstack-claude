@@ -10,7 +10,7 @@ import { agentBody, alive, fakeCtx, fakePi, gitRepo, readEntries, resultText, sl
 
 const fakeBb = fileURLToPath(new URL("./fake-bb.mjs", import.meta.url));
 const bb = { cli: fakeBb, projectId: "proj_p", threadId: "thr_self", environmentId: "env_e" };
-const bbBatch = { pollMs: 30, heartbeatMs: 150, deadlineS: 600, staleMs: 1500, boundMs: 60_000 };
+const bbBatch = { pollMs: 30, heartbeatMs: 150, deadlineS: 600, staleMs: 1500, boundMs: 60_000, maxMs: 60_000 };
 
 let w;
 let saved;
@@ -371,6 +371,24 @@ describe("batch", () => {
     finish("thr_child3");
     expect(kinds()).toEqual(["queued", "child-completed"]);
     expect(wakes()[1].child).toBe("thr_child3");
+  });
+
+  test("agents that keep booking their own wakeups cannot hold the batch past its overall bound, and their latest replies come with it", async () => {
+    const { ids } = await fanOut(2, { timing: { maxMs: 1500 } });
+    for (const id of ids) {
+      bbDoes("__queue", id, JSON.stringify({ sendAt: Date.now() + 3_600_000 }));
+      finish(id, { output: `${id}: CI still pending, checking again in an hour` });
+    }
+    await sleep(300);
+    expect(wakes()).toEqual([]);
+
+    await waitFor(() => wakes().length > 0);
+    const { text } = wakes()[0];
+    expect(text).toStartWith("[pstack batch] 0 of the 2 agents");
+    for (const id of ids) expect(text).toContain(`status: waiting\nthread: @thread:${id}\n\n${id}: CI still pending, checking again in an hour`);
+    await waitFor(batchOver);
+    expect(ids.map((id) => state().threads[id].parentNotifications)).toEqual(["auto", "auto"]);
+    expect(kinds()).toEqual(["queued"]);
   });
 
   test("a batch whose parent's run ended without sealing it still reports, so its tracker never keeps the message back forever", async () => {

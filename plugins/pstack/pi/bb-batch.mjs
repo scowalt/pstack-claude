@@ -32,7 +32,13 @@ import { BbCli, RUNNING, TRACKER_CALL_TIMEOUT_MS, resultText } from "./bb-cli.mj
 // started within two minutes of each other (Nov 2026), the last's final update
 // came within 16 minutes of the first's in 9 in 10 and within 34 in 19 in 20,
 // so 30 minutes rarely cuts a batch short.
-export const DEFAULT_TIMING = { pollMs: 5000, heartbeatMs: 120_000, deadlineS: 600, staleMs: 180_000, boundMs: 1_800_000 };
+// maxMs: the batch reports this long after it opened even if no agent has
+// finished, so agents that keep booking their own wakeups cannot hold it
+// forever. Of 378 groups of sibling threads bb started within two minutes of
+// each other (Sep to Nov 2026, timed by each thread's turns), the first
+// finished within 85 minutes in 99 in 100 and within 114 in all, and the last
+// within 2 hours in 97 in 100.
+export const DEFAULT_TIMING = { pollMs: 5000, heartbeatMs: 120_000, deadlineS: 600, staleMs: 180_000, boundMs: 1_800_000, maxMs: 7_200_000 };
 
 const TRACKER = fileURLToPath(import.meta.url);
 const FROM_PSTACK = "This message comes from pstack's agent tool, not from the user.";
@@ -116,7 +122,7 @@ export class Batches {
     if (!queuedMessage?.id) throw new Error(`bb did not hold the batch's message: ${JSON.stringify(queuedMessage)}`);
     mkdirSync(this.dir, { recursive: true });
     const path = join(this.dir, `${Date.now()}-${randomBytes(4).toString("hex")}.json`);
-    writeJson(path, { parent: this.threadId, cli: this.cli, row: queuedMessage.id, members: [], sealed: false, timing: this.timing });
+    writeJson(path, { parent: this.threadId, cli: this.cli, row: queuedMessage.id, opened: Date.now(), members: [], sealed: false, timing: this.timing });
     // A tool call later in this response may run for longer than the message is held.
     this.track(path);
     return path;
@@ -205,19 +211,24 @@ async function finished(bb, member) {
   return !queued.some(pending) && !children.some((c) => RUNNING.has(c.status));
 }
 
-async function report(bb, members, done) {
+const minutes = (ms) => Math.round(ms / 60_000);
+
+// stopped: why the batch stopped waiting, when some agents have not finished.
+async function report(bb, members, done, stopped) {
   const parts = await Promise.all(
     members.map(async ({ id, title, status }, i) => {
-      if (!done[i]) return resultText(id, title ?? "", { status: "running", output: "Still running. It reports to you on its own when it finishes." });
+      if (!done[i] && RUNNING.has(status)) return resultText(id, title ?? "", { status: "running", output: "Still running. It reports to you on its own when it finishes." });
       const { output } = await bb.json(["thread", "output", id]).catch(() => ({ output: null }));
-      return resultText(id, title ?? "", { status: STATUS[status] ?? status, output: output || "(no output)" });
+      if (done[i]) return resultText(id, title ?? "", { status: STATUS[status] ?? status, output: output || "(no output)" });
+      const waiting = "[Not finished: bb holds more work for it, such as a wakeup it booked, or its own agents still run. It reports to you on its own when it finishes.]";
+      return resultText(id, title ?? "", { status: "waiting", output: `${output || "(no output yet)"}\n\n${waiting}` });
     }),
   );
   const count = done.filter(Boolean).length;
   const head =
     count === members.length
       ? `[pstack batch] All ${members.length} agents this thread started together in one response have finished. bb held each one's own report until the last finished, so here are all of them.`
-      : `[pstack batch] ${count} of the ${members.length} agents this thread started together in one response have finished, and the rest are still running well after the first finished, so here are the finished ones' reports now. The others report to you one by one as they finish.`;
+      : `[pstack batch] ${count} of the ${members.length} agents this thread started together in one response have finished. The batch stopped waiting for the rest ${stopped}, so here is where each one stands. The others report to you one by one as they finish.`;
   return `${head}\n\n${parts.join("\n\n---\n\n")}\n\n${FROM_PSTACK}`;
 }
 
@@ -245,13 +256,19 @@ async function step(bb, record, look) {
     const all = done.every(Boolean);
     if (done.some(Boolean)) look.firstDone ??= Date.now();
     // Two looks in a row, so an agent idle only for the moment before bb starts its next turn is not taken for finished.
-    const ready = (all && look.allDone) || (look.firstDone !== undefined && Date.now() - look.firstDone >= timing.boundMs);
+    const stopped =
+      Date.now() - record.opened >= timing.maxMs
+        ? `${minutes(timing.maxMs)} minutes after they started`
+        : look.firstDone !== undefined && Date.now() - look.firstDone >= timing.boundMs
+          ? `${minutes(timing.boundMs)} minutes after the first finished`
+          : undefined;
+    const ready = (all && look.allDone) || stopped !== undefined;
     look.allDone = all;
     if (ready) {
       // Handed back before the report goes, so an agent that finishes in between reports on its own rather than not at all.
       await handBack(bb, members);
       try {
-        await bb.json(["thread", "queue", "update", parent, row, "--message-file", "-"], await report(bb, members, done));
+        await bb.json(["thread", "queue", "update", parent, row, "--message-file", "-"], await report(bb, members, done, stopped));
         await bb.json(["thread", "queue", "send", parent, row, "--mode", "auto"]);
       } catch (e) {
         if (!(await delivered(bb, record))) throw e;

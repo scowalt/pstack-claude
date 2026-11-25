@@ -33,6 +33,13 @@ function bbEnv(): BbEnv | undefined {
   return { cli: BB_CLI || "bb", projectId: BB_PROJECT_ID, threadId: BB_THREAD_ID, environmentId: BB_ENVIRONMENT_ID };
 }
 
+// T3 Code, and forks such as Wonderbase, set these for a pi thread whose T3 tools, delegate_task
+// among them, are loaded.
+function t3ThreadId(): string | undefined {
+  const { T3CODE_THREAD_ID, T3_MCP_URL } = process.env;
+  return T3CODE_THREAD_ID && T3_MCP_URL ? T3CODE_THREAD_ID : undefined;
+}
+
 export interface Settings {
   pluginRoot: string;
   modelsFile: string;
@@ -46,6 +53,8 @@ export interface Settings {
   exitGraceMs: number;
   // Set when pi runs as a bb thread: the agent tools then start bb child threads.
   bb?: BbEnv;
+  // Set when pi runs as a T3 Code thread: subagents are then T3's delegate_task child threads.
+  t3ThreadId?: string;
 }
 
 // Pi re-runs itself for children when it can: the same runtime and CLI script,
@@ -74,6 +83,7 @@ export function defaultSettings(readDepth: () => number, agentDir = process.env.
     killGraceMs: 5000,
     exitGraceMs: 30_000,
     bb: bbEnv(),
+    t3ThreadId: t3ThreadId(),
   };
 }
 

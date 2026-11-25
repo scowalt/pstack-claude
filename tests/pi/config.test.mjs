@@ -19,6 +19,24 @@ test("depth comes from the reader on each use and PI_CODING_AGENT_DIR moves the 
   expect(defaultSettings(() => 0, "").agentDir).toBe(join(homedir(), ".pi", "agent"));
 });
 
+test("a T3 Code thread needs both its thread id and its MCP URL", () => {
+  const saved = { ...process.env };
+  try {
+    for (const [env, expected] of [
+      [{ T3CODE_THREAD_ID: "thread-1", T3_MCP_URL: "http://127.0.0.1:1/mcp" }, "thread-1"],
+      [{ T3CODE_THREAD_ID: "thread-1" }, undefined],
+      [{ T3_MCP_URL: "http://127.0.0.1:1/mcp" }, undefined],
+    ]) {
+      delete process.env.T3CODE_THREAD_ID;
+      delete process.env.T3_MCP_URL;
+      Object.assign(process.env, env);
+      expect({ env, id: defaultSettings(() => 0).t3ThreadId }).toEqual({ env, id: expected });
+    }
+  } finally {
+    process.env = saved;
+  }
+});
+
 test.each(["openai", "openai-codex"])("OpenAI aliases prefer the 6.2 model in %s when its catalog lists it", (provider) => {
   const settings = defaultSettings(() => 0);
   const parent = `${provider}/parent`;

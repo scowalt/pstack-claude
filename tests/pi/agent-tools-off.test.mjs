@@ -18,3 +18,12 @@ test("pi agent tools: off drops exactly the four agent tools and /pstack-agents"
   expect(only(off.tools, on.tools)).toEqual([]);
   expect(only(off.commands, on.commands)).toEqual([]);
 });
+
+// A Wonderbase (T3 Code fork) thread starts subagents with T3's delegate_task, which makes a child
+// thread the sidebar shows; a pstack pi child process would be invisible there.
+test("a Wonderbase thread leaves subagents to delegate_task", () => {
+  const { pi } = setup({ settings: { t3ThreadId: "thread-1" } });
+  for (const name of ["agent", "list_agents", "send_message", "stop_agent"]) expect(pi.tools.has(name)).toBe(false);
+  expect(pi.commands.has("pstack-agents")).toBe(false);
+  expect(pi.tools.has("schedule_wakeup")).toBe(true);
+});

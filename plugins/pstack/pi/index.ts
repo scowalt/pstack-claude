@@ -17,7 +17,8 @@ export function install(pi: ExtensionAPI, settings: Settings): void {
   // Pi registers tools here, before any session directory is known, so these switches come from the directory Pi started in.
   const sheet = readSheet(settings.agentDir, process.cwd());
   const bb = settings.bb && !sheet?.bbAgentsOff ? new BbAgents(pi, settings, settings.bb) : undefined;
-  if (!sheet?.agentToolsOff) {
+  // T3's delegate_task makes a child thread its sidebar shows; a pi child process would be invisible there.
+  if (!sheet?.agentToolsOff && !settings.t3ThreadId) {
     if (bb) registerBbAgentTools(pi, bb, settings);
     else registerAgentTools(pi, runner, settings);
   }

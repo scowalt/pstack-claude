@@ -36,7 +36,7 @@ Keep the outcome a state, not a task. "Fix the login bug" is a task. "Every logi
 1. Settle the sentence with the user. If they gave a task, propose the state it serves. Ask for what goes under **Allowed** and **Ask first** with `AskUserQuestion`, one question per decision, with a recommendation. Authority is the user's call.
 2. Write `proof`. Run it and show it passing. Then show it failing: run it against a revision, fixture, or input where the outcome is false. A proof that cannot fail proves nothing. Keep its output stable between runs, with no timestamps.
 3. Write `OUTCOME.md`, and land both files through the [Opening a PR](../poteto-mode/playbooks/opening-a-pr.md) playbook. The automation reads `proof` from the remote default branch, so nothing below works before the merge.
-4. Make this thread easy to find: `bb thread update --self --title "Keep true: <sentence>"`, then `bb thread pin "$BB_THREAD_ID"`.
+4. Make this thread easy to find: `bb thread update --self --title "Keep true: <sentence>"`.
 5. Create the check. `<skill>` is this file's directory, and the schedule is the slowest one that still catches a break before it matters:
 
    ```bash
@@ -71,4 +71,4 @@ A `keep-true improve <slug>` message starts this. Look for one change that makes
 
 ## Retire
 
-Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name), remove the outcome directory through a PR, and unpin this thread.
+Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name) and remove the outcome directory through a PR.

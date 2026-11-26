@@ -4,7 +4,7 @@ Start with the [README](../README.md) for installation and your first task.
 
 ## Slash commands
 
-The package includes 68 skill directories: 44 public skills and 24 `principle-*` references. Claude Code uses `/pstack:<name>`, Pi uses `/skill:<name>`, and Muse lists each user-invocable skill as `/<name>`. In Codex, mention a skill with `$<name>`, such as `$poteto-mode`, or pick one from `/skills`.
+The package includes 69 skill directories: 45 public skills and 24 `principle-*` references. Claude Code uses `/pstack:<name>`, Pi uses `/skill:<name>`, and Muse lists each user-invocable skill as `/<name>`. In Codex, mention a skill with `$<name>`, such as `$poteto-mode`, or pick one from `/skills`.
 
 Find each skill's instructions in the [skills tree](../plugins/pstack/skills/).
 
@@ -46,6 +46,7 @@ Find each skill's instructions in the [skills tree](../plugins/pstack/skills/).
 | `/statechart` | check a TLA+ model and draw it as a Mermaid statechart, with the shortest path to each state that breaks a rule |
 | `/deslop` | deslop a diff before commit |
 | `/babysit` | monitor an open PR, fix CI/comments, keep it merge-ready |
+| `/keep-true` | keep a stated outcome true after it ships: a bb automation runs its proof on a schedule and wakes the thread to repair it within limits you set |
 | `/thermo-nuclear-review` | audit a branch's changes for bugs, breakage, security issues, devex regressions, and feature-gate leaks |
 | `/thermo-nuclear-code-quality-review` | extremely strict maintainability audit |
 | `/thermos` | run both thermo-nuclear reviews as parallel subagents and synthesize their findings |
@@ -170,7 +171,7 @@ The Muse build is a native Muse plugin bundle rooted at `plugins/pstack/`. Its [
 
 Install from a clone as the [README](../README.md) shows, then approve the plugin. Muse runs third-party hooks and agent definitions only after `muse plugins approve pstack`; until then the skills work on request and nothing routes automatically. Once approved, the hook prints the [Muse routing instruction](../plugins/pstack/hooks/session-start-muse.md) as plain additional context, plus the saved role lines from `${XDG_CONFIG_HOME:-~/.config}/muse/pstack-models.md` when the sheet has any. Only known role lines whose entries are model IDs or aliases reach the context, rebuilt from their checked values. `session hook: off` in the sheet disables the injection, as on the other runtimes.
 
-Muse caps its skill catalog at 32 KB, so with pstack's 68 skills installed it compacts descriptions to fit; no skill id is dropped, and every skill still loads by name. The plugin's four `agents/` files register as Muse agent definitions under scoped ids such as `pstack/poteto-agent`, so poteto-mode's dispatches resolve as written, through the Muse mapping. A role's effort suffix passes as a Workflow child's `effort`, the Muse form of the dispatch effort field every runtime now uses. The Muse block of `models.json` gives a Muse model per tier; `subagent_spawn` takes a definition rather than a model, so per-role models apply where the dispatch takes one (a Workflow child's `model`), and the mapping says so. The `typescript-best-practices` skill's `paths` frontmatter is metadata on Muse, so `muse skills validate` reports it as an unsupported-field warning while the skill stays valid.
+Muse caps its skill catalog at 32 KB, so with pstack's 69 skills installed it compacts descriptions to fit; no skill id is dropped, and every skill still loads by name. The plugin's four `agents/` files register as Muse agent definitions under scoped ids such as `pstack/poteto-agent`, so poteto-mode's dispatches resolve as written, through the Muse mapping. A role's effort suffix passes as a Workflow child's `effort`, the Muse form of the dispatch effort field every runtime now uses. The Muse block of `models.json` gives a Muse model per tier; `subagent_spawn` takes a definition rather than a model, so per-role models apply where the dispatch takes one (a Workflow child's `model`), and the mapping says so. The `typescript-best-practices` skill's `paths` frontmatter is metadata on Muse, so `muse skills validate` reports it as an unsupported-field warning while the skill stays valid.
 
 Update an installed copy after a `git pull` with `muse plugins update pstack`, and re-approve when Muse asks, since approval is pinned to the hook and agent definitions it first saw. Remove it with `muse plugins remove pstack`.
 

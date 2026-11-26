@@ -1,11 +1,11 @@
 ---
 name: keep-true
-description: "Keep a stated outcome true after the work ships. Writes the outcome, an executable proof, and what the agent may touch into the repo, then has a bb automation run the proof on a schedule and wake this thread to repair it within those limits. Use for /keep-true, 'keep this true', 'keep X at parity', or any request that should stay done rather than get done once."
+description: "Keep a stated outcome true after the work ships. Writes the outcome, an executable proof, and what the agent may touch into the repo, then has a bb automation run the proof on a schedule and open a new thread to repair it within those limits. Use for /keep-true, 'keep this true', 'keep X at parity', or any request that should stay done rather than get done once."
 ---
 
 # Keep true
 
-A task ends when it ships. An outcome stays true for as long as someone depends on it. This skill turns the thread that runs it into the outcome's keeper: a bb script automation runs the outcome's proof on a schedule, stays silent while the proof passes, and tells this thread when the proof fails or passes again.
+A task ends when it ships. An outcome stays true for as long as someone depends on it. This skill sets up a bb script automation that runs the outcome's proof on a schedule and stays silent while it passes. When the proof fails, the automation opens a new thread in the project to repair it, and tells that thread when the proof passes again. No thread has to stay open: the user can archive the setup thread once setup is done.
 
 This skill needs bb. If `BB_THREAD_ID` is unset, say so and stop.
 
@@ -23,7 +23,7 @@ Each outcome is a directory in the repository it concerns, `.agents/outcomes/<sl
 What `proof` checks, in words, and why passing it means the sentence is true.
 
 ## Allowed
-What the keeper may do without asking: the paths it may edit, whether it may merge its own PRs, which services it may call.
+What a repair thread may do without asking: the paths it may edit, whether it may merge its own PRs, which services it may call.
 
 ## Ask first
 The decisions that stay with the user. Always includes changing `proof` or this file.
@@ -36,33 +36,26 @@ Keep the outcome a state, not a task. "Fix the login bug" is a task. "Every logi
 1. Settle the sentence with the user. If they gave a task, propose the state it serves. Ask for what goes under **Allowed** and **Ask first** with `AskUserQuestion`, one question per decision, with a recommendation. Authority is the user's call.
 2. Write `proof`. Run it and show it passing. Then show it failing: run it against a revision, fixture, or input where the outcome is false. A proof that cannot fail proves nothing. Keep its output stable between runs, with no timestamps.
 3. Write `OUTCOME.md`, and land both files through the [Opening a PR](../poteto-mode/playbooks/opening-a-pr.md) playbook. The automation reads `proof` from the remote default branch, so nothing below works before the merge.
-4. Make this thread easy to find: `bb thread update --self --title "Keep true: <sentence>"`.
-5. Create the check. `<skill>` is this file's directory, and the schedule is the slowest one that still catches a break before it matters:
+4. Create the check. `<skill>` is this file's directory, and the schedule is the slowest one that still catches a break before it matters:
 
    ```bash
    bb automation create --project "$BB_PROJECT_ID" --name "keep-true: <slug>" \
      --cron "<expr>" --timezone "<IANA zone>" \
      --script-file <skill>/scripts/check-outcome.sh --interpreter bash --timeout 15m \
      --working-directory project \
-     --env-json '{"OUTCOME":"<slug>","KEEPER":"'"$BB_THREAD_ID"'"}'
+     --env-json '{"OUTCOME":"<slug>"}'
    ```
 
    `--working-directory project` needs the project's source on the bb server host. When it has none, pass the absolute path of a clone there instead.
-6. Run it once with `bb automation run <id> --project "$BB_PROJECT_ID"`, and confirm with `bb automation runs <id> --project "$BB_PROJECT_ID"` that the run ended silent, which means the proof passed.
-7. Optionally, have this thread look for improvements on its own. Read the provider and model from `bb thread show "$BB_THREAD_ID" --json`, then create a weekly agent automation with `--target-thread "$BB_THREAD_ID"` and the prompt `keep-true improve <slug>`.
-8. Park this thread: run `<skill>/scripts/park-after-turn.sh` as your last command, then send your reply.
-
-## Parking
-
-The keeper thread stays on bb's Parked shelf while the outcome holds. The automation's message is new activity, which brings the thread back to Active. Never pin it.
-
-End each turn that leaves nothing for the user with `<skill>/scripts/park-after-turn.sh`, run just before your reply. That covers setup, **Recovered**, a **Repair** that finds the proof already passing, and an **Improve** with nothing worth doing. The script parks the thread once the turn ends. Running `bb sidebar park` during the turn doesn't stick, because the reply that follows returns the thread to Active. Don't park a turn that asks the user something or reports a landed fix.
+5. Run it once with `bb automation run <id> --project "$BB_PROJECT_ID"`, and confirm with `bb automation runs <id> --project "$BB_PROJECT_ID"` that the run ended silent, which means the proof passed.
+6. Optionally, look for improvements on a schedule. Read the provider and model from `bb thread show "$BB_THREAD_ID" --json`, then create a weekly agent automation with `--new-environment worktree` and the prompt `keep-true improve <slug>`. Each run opens its own thread. Never pass `--target-thread`: bb disables an automation whose target thread is archived.
+7. Tell the user this thread can be archived. A break opens its own thread.
 
 ## Repair
 
-A `[keep-true] <slug> broke` message starts this.
+A `[keep-true] <slug> broke` message starts this, as the first message of a thread the automation opened.
 
-1. Fetch, and rerun `proof` on the latest remote default branch. If it passes now, park, reply in one line, and stop.
+1. Fetch, and rerun `proof` on the latest remote default branch. If it passes now, reply in one line and stop.
 2. Find the root cause per the [Bug fix](../poteto-mode/playbooks/bug-fix.md) playbook. Start the fix on a new branch from the remote default branch.
 3. Do only what **Allowed** covers. Anything under **Ask first**, or outside **Allowed**, goes to the user through `AskUserQuestion`. Then stop.
 4. Never weaken `proof` or edit `OUTCOME.md` to make the check pass. That changes the outcome, and it is the user's decision.
@@ -70,7 +63,7 @@ A `[keep-true] <slug> broke` message starts this.
 
 ## Recovered
 
-A `[keep-true] <slug> holds again` message starts this. Park, then reply in one line with what fixed it: your PR, someone else's commit, or a recovery outside the repository.
+A `[keep-true] <slug> holds again` message starts this, in the thread the automation opened for the break. Reply in one line with what fixed it: your PR, someone else's commit, or a recovery outside the repository.
 
 ## Improve
 
@@ -78,4 +71,4 @@ A `keep-true improve <slug>` message starts this. Look for one change that makes
 
 ## Retire
 
-Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name), remove the outcome directory through a PR, and return this thread to Active with `bb sidebar resume`.
+Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name) and remove the outcome directory through a PR.

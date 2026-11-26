@@ -46,7 +46,7 @@ Find each skill's instructions in the [skills tree](../plugins/pstack/skills/).
 | `/statechart` | check a TLA+ model and draw it as a Mermaid statechart, with the shortest path to each state that breaks a rule |
 | `/deslop` | deslop a diff before commit |
 | `/babysit` | monitor an open PR, fix CI/comments, keep it merge-ready |
-| `/keep-true` | keep a stated outcome true after it ships: a bb automation runs its proof on a schedule and wakes the thread to repair it within limits you set |
+| `/keep-true` | keep a stated outcome true after it ships: a bb automation runs its proof on a schedule and opens a thread to repair it within limits you set |
 | `/thermo-nuclear-review` | audit a branch's changes for bugs, breakage, security issues, devex regressions, and feature-gate leaks |
 | `/thermo-nuclear-code-quality-review` | extremely strict maintainability audit |
 | `/thermos` | run both thermo-nuclear reviews as parallel subagents and synthesize their findings |

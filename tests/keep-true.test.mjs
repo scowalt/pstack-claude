@@ -1,8 +1,8 @@
 // keep-true's check-outcome.sh, run for real against a local origin and a
-// fake bb that records every message it is asked to send.
+// fake bb that records every thread it opens and every message it sends.
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,12 +19,24 @@ const git = (cwd, ...args) => {
 
 const bin = join(root, "bin");
 const told = join(root, "told.log");
+const archived = join(root, "archived");
+const spawned = join(root, "spawned");
 mkdirSync(bin);
 writeFileSync(
   join(bin, "bb"),
-  `#!/bin/sh\n[ -e "${root}/bb-fails" ] && exit 1\n{ echo "ARGS: $*"; cat; echo "---"; } >> "${told}"\n`,
+  `#!/bin/sh
+[ -e "${root}/bb-fails" ] && exit 1
+{ echo "ARGS: $*"; cat; echo "---"; } >> "${told}"
+if [ "$1 $2" = "thread tell" ] && grep -qx "$3" "${archived}" 2>/dev/null; then echo "Thread is archived" >&2; exit 1; fi
+if [ "$1 $2" = "thread spawn" ]; then
+  n=$(( $(cat "${spawned}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "${spawned}"
+  printf '{"id":"thr_repair%s","status":"starting","projectId":"proj_1","environment":{"id":"env_%s"}}\\n' "$n" "$n"
+fi
+exit 0
+`,
 );
 chmodSync(join(bin, "bb"), 0o755);
+const archive = (thread) => appendFileSync(archived, `${thread}\n`);
 
 const origin = join(root, "origin.git");
 const work = join(root, "work");
@@ -50,7 +62,7 @@ function publish(proofBody) {
 publish("echo ok");
 git(root, "clone", "--quiet", origin, clone);
 
-function check() {
+function check(extraEnv = {}) {
   rmSync(told, { force: true });
   const r = spawnSync("bash", [script], {
     cwd: clone,
@@ -59,35 +71,53 @@ function check() {
       PATH: `${bin}:${process.env.PATH}`,
       HOME: root,
       OUTCOME: "demo",
-      KEEPER: "thr_keeper",
+      BB_PROJECT_ID: "proj_1",
       BB_AUTOMATION_ID: "aut_1",
       KEEP_TRUE_STATE: join(root, "state"),
+      ...extraEnv,
     },
   });
   return { status: r.status, out: r.stdout, err: r.stderr, told: existsSync(told) ? readFileSync(told, "utf8") : "" };
 }
 
 describe("check-outcome.sh", () => {
-  test("stays silent while the proof passes", () => {
-    expect(check()).toMatchObject({ status: 0, out: "", told: "" });
+  test("stays silent while the proof passes, from its first run", () => {
+    expect(check()).toMatchObject({ status: 0, out: "", err: "", told: "" });
   });
 
-  test("tells the keeper once when the proof starts failing, with its output", () => {
+  test("opens one repair thread in the project when the proof starts failing, with its output", () => {
     publish('echo "parity gap: settings screen"; exit 3');
     const first = check();
-    expect(first).toMatchObject({ status: 0, out: "told thr_keeper: demo broke (exit 3)\n" });
-    expect(first.told).toContain("ARGS: thread tell thr_keeper --mode auto --message-file -");
+    expect(first).toMatchObject({ status: 0, out: "opened thr_repair1: demo broke (exit 3)\n" });
+    expect(first.told).toContain(
+      "ARGS: thread spawn --project proj_1 --new-environment worktree --title keep-true: demo broke --json --prompt-file -",
+    );
     expect(first.told).toContain("[keep-true] demo broke at origin/main");
+    expect(first.told).toContain("Repair steps for .agents/outcomes/demo");
     expect(first.told).toContain("parity gap: settings screen");
     expect(check()).toMatchObject({ status: 0, out: "", told: "" });
   });
 
-  test("tells the keeper once when the proof passes again", () => {
+  test("tells the repair thread once when the proof passes again", () => {
     publish("echo ok");
     const first = check();
-    expect(first.status).toBe(0);
+    expect(first).toMatchObject({ status: 0, out: "told thr_repair1: demo holds again\n" });
+    expect(first.told).toContain("ARGS: thread tell thr_repair1 --mode auto --message-file -");
     expect(first.told).toContain("[keep-true] demo holds again at origin/main");
     expect(check()).toMatchObject({ status: 0, out: "", told: "" });
+  });
+
+  test("alerts and recovers after the setup thread is archived, as thr_3q6f6r2iya's was", () => {
+    archive("thr_3q6f6r2iya");
+    const setupThread = { KEEPER: "thr_3q6f6r2iya" };
+    publish("exit 1");
+    expect(check(setupThread)).toMatchObject({ status: 0, out: "opened thr_repair2: demo broke (exit 1)\n" });
+    archive("thr_repair2");
+    publish("echo ok");
+    const recovered = check(setupThread);
+    expect(recovered.status).toBe(0);
+    expect(recovered.out).toContain("its repair thread thr_repair2 is gone");
+    expect(check(setupThread)).toMatchObject({ status: 0, out: "", told: "" });
   });
 
   test("checks the remote default branch, not the clone's working tree", () => {
@@ -103,63 +133,19 @@ describe("check-outcome.sh", () => {
     expect(r.told).toContain(".agents/outcomes/demo/proof is missing or not executable");
   });
 
-  test("fails the run and keeps the old state when bb cannot deliver the message", () => {
+  test("fails the run and keeps the old state when bb cannot open the repair thread", () => {
     publish("echo ok");
+    expect(check().status).toBe(0);
+    publish("exit 2");
     writeFileSync(join(root, "bb-fails"), "");
     const failed = check();
     expect(failed.status).not.toBe(0);
-    expect(failed.err).toContain("bb thread tell thr_keeper failed");
+    expect(failed.err).toContain("bb thread spawn failed");
     rmSync(join(root, "bb-fails"));
-    expect(check().told).toContain("demo holds again");
+    expect(check().told).toContain("demo broke");
   });
 
   test("removes its temporary worktree", () => {
     expect(git(clone, "worktree", "list").split("\n")).toHaveLength(1);
-  });
-});
-
-describe("park-after-turn.sh", () => {
-  const parkScript = fileURLToPath(new URL("../plugins/pstack/skills/keep-true/scripts/park-after-turn.sh", import.meta.url));
-  const parkBin = join(root, "park-bin");
-  const calls = join(root, "park-calls.log");
-  mkdirSync(parkBin);
-  writeFileSync(
-    join(parkBin, "bb"),
-    `#!/bin/sh\necho "$*" >> "${calls}"\n[ "$1 $2" = "thread wait" ] && { sleep 1; [ -e "${root}/wait-fails" ] && exit 1; }\nexit 0\n`,
-  );
-  chmodSync(join(parkBin, "bb"), 0o755);
-
-  const park = () => {
-    rmSync(calls, { force: true });
-    const started = Date.now();
-    const r = spawnSync("bash", [parkScript], {
-      encoding: "utf8",
-      env: { PATH: `${parkBin}:${process.env.PATH}`, BB_THREAD_ID: "thr_keeper" },
-    });
-    return { status: r.status, returnedAfter: Date.now() - started };
-  };
-  const callsAfter = async (ms) => {
-    await Bun.sleep(ms);
-    return existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [];
-  };
-
-  test("returns at once and parks the thread only after its turn ends", async () => {
-    const r = park();
-    expect(r.status).toBe(0);
-    expect(r.returnedAfter).toBeLessThan(900);
-    expect(await callsAfter(2500)).toEqual(["thread wait thr_keeper --timeout 2h", "sidebar park --thread thr_keeper"]);
-  });
-
-  test("leaves the thread active when the turn never ends", async () => {
-    writeFileSync(join(root, "wait-fails"), "");
-    park();
-    expect(await callsAfter(2500)).toEqual(["thread wait thr_keeper --timeout 2h"]);
-    rmSync(join(root, "wait-fails"));
-  });
-
-  test("refuses to run outside bb", () => {
-    const r = spawnSync("bash", [parkScript], { encoding: "utf8", env: { PATH: `${parkBin}:${process.env.PATH}` } });
-    expect(r.status).not.toBe(0);
-    expect(r.stderr).toContain("park-after-turn needs bb");
   });
 });

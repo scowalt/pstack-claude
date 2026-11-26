@@ -117,3 +117,49 @@ describe("check-outcome.sh", () => {
     expect(git(clone, "worktree", "list").split("\n")).toHaveLength(1);
   });
 });
+
+describe("park-after-turn.sh", () => {
+  const parkScript = fileURLToPath(new URL("../plugins/pstack/skills/keep-true/scripts/park-after-turn.sh", import.meta.url));
+  const parkBin = join(root, "park-bin");
+  const calls = join(root, "park-calls.log");
+  mkdirSync(parkBin);
+  writeFileSync(
+    join(parkBin, "bb"),
+    `#!/bin/sh\necho "$*" >> "${calls}"\n[ "$1 $2" = "thread wait" ] && { sleep 1; [ -e "${root}/wait-fails" ] && exit 1; }\nexit 0\n`,
+  );
+  chmodSync(join(parkBin, "bb"), 0o755);
+
+  const park = () => {
+    rmSync(calls, { force: true });
+    const started = Date.now();
+    const r = spawnSync("bash", [parkScript], {
+      encoding: "utf8",
+      env: { PATH: `${parkBin}:${process.env.PATH}`, BB_THREAD_ID: "thr_keeper" },
+    });
+    return { status: r.status, returnedAfter: Date.now() - started };
+  };
+  const callsAfter = async (ms) => {
+    await Bun.sleep(ms);
+    return existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [];
+  };
+
+  test("returns at once and parks the thread only after its turn ends", async () => {
+    const r = park();
+    expect(r.status).toBe(0);
+    expect(r.returnedAfter).toBeLessThan(900);
+    expect(await callsAfter(2500)).toEqual(["thread wait thr_keeper --timeout 2h", "sidebar park --thread thr_keeper"]);
+  });
+
+  test("leaves the thread active when the turn never ends", async () => {
+    writeFileSync(join(root, "wait-fails"), "");
+    park();
+    expect(await callsAfter(2500)).toEqual(["thread wait thr_keeper --timeout 2h"]);
+    rmSync(join(root, "wait-fails"));
+  });
+
+  test("refuses to run outside bb", () => {
+    const r = spawnSync("bash", [parkScript], { encoding: "utf8", env: { PATH: `${parkBin}:${process.env.PATH}` } });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("park-after-turn needs bb");
+  });
+});

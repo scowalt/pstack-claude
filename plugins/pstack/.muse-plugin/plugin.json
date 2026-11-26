@@ -101,6 +101,11 @@
         "enabledDefault": true
       },
       {
+        "id": "keep-true",
+        "path": "skills/keep-true/SKILL.md",
+        "enabledDefault": true
+      },
+      {
         "id": "ketchup",
         "path": "skills/ketchup/SKILL.md",
         "enabledDefault": true

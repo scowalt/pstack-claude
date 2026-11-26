@@ -50,12 +50,19 @@ Keep the outcome a state, not a task. "Fix the login bug" is a task. "Every logi
    `--working-directory project` needs the project's source on the bb server host. When it has none, pass the absolute path of a clone there instead.
 6. Run it once with `bb automation run <id> --project "$BB_PROJECT_ID"`, and confirm with `bb automation runs <id> --project "$BB_PROJECT_ID"` that the run ended silent, which means the proof passed.
 7. Optionally, have this thread look for improvements on its own. Read the provider and model from `bb thread show "$BB_THREAD_ID" --json`, then create a weekly agent automation with `--target-thread "$BB_THREAD_ID"` and the prompt `keep-true improve <slug>`.
+8. Park this thread: run `<skill>/scripts/park-after-turn.sh` as your last command, then send your reply.
+
+## Parking
+
+The keeper thread stays on bb's Parked shelf while the outcome holds. The automation's message is new activity, which brings the thread back to Active. Never pin it.
+
+End each turn that leaves nothing for the user with `<skill>/scripts/park-after-turn.sh`, run just before your reply. That covers setup, **Recovered**, a **Repair** that finds the proof already passing, and an **Improve** with nothing worth doing. The script parks the thread once the turn ends. Running `bb sidebar park` during the turn doesn't stick, because the reply that follows returns the thread to Active. Don't park a turn that asks the user something or reports a landed fix.
 
 ## Repair
 
 A `[keep-true] <slug> broke` message starts this.
 
-1. Fetch, and rerun `proof` on the latest remote default branch. If it passes now, reply in one line and stop.
+1. Fetch, and rerun `proof` on the latest remote default branch. If it passes now, park, reply in one line, and stop.
 2. Find the root cause per the [Bug fix](../poteto-mode/playbooks/bug-fix.md) playbook. Start the fix on a new branch from the remote default branch.
 3. Do only what **Allowed** covers. Anything under **Ask first**, or outside **Allowed**, goes to the user through `AskUserQuestion`. Then stop.
 4. Never weaken `proof` or edit `OUTCOME.md` to make the check pass. That changes the outcome, and it is the user's decision.
@@ -63,7 +70,7 @@ A `[keep-true] <slug> broke` message starts this.
 
 ## Recovered
 
-A `[keep-true] <slug> holds again` message starts this. Reply in one line with what fixed it: your PR, someone else's commit, or a recovery outside the repository.
+A `[keep-true] <slug> holds again` message starts this. Park, then reply in one line with what fixed it: your PR, someone else's commit, or a recovery outside the repository.
 
 ## Improve
 
@@ -71,4 +78,4 @@ A `keep-true improve <slug>` message starts this. Look for one change that makes
 
 ## Retire
 
-Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name) and remove the outcome directory through a PR.
+Delete the automations (`bb automation list --project "$BB_PROJECT_ID"` lists them by name), remove the outcome directory through a PR, and return this thread to Active with `bb sidebar resume`.

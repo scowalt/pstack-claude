@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { BbCli } from "./bb.ts";
+import { BbCli } from "./bb-cli.mjs";
 import type { BbEnv } from "./config.ts";
 import type { OneShot } from "./one-shot.ts";
 import { expandSlash } from "./slash.ts";

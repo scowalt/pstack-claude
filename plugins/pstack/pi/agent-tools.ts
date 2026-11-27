@@ -10,7 +10,13 @@ import { isForegroundWait } from "./sleep-wait.ts";
 // Claude Code's Agent tool lists every agent type, the user's included, with its description.
 const typeLine = ([type, { description }]: [string, AgentDefinition]) => `- ${type === GENERAL_PURPOSE ? `${type} (default)` : type}${description ? `: ${description}` : ""}`;
 
-export const agentParams = (types: Map<string, AgentDefinition>) => Type.Object(
+// batch exists only inside bb, where a held bb message can wait for several child threads.
+const batchParam = Type.Boolean({
+  description:
+    "With run_in_background: report this agent together with every other agent this response starts with batch: true. bb wakes this thread once, when the last of them finishes, with all of their results. An agent that fails, or stops on an approval or a question, still wakes it at once.",
+});
+
+export const agentParams = (types: Map<string, AgentDefinition>, { batch = false } = {}) => Type.Object(
   {
     description: Type.String({ description: "A short (3-5 word) description of the task" }),
     prompt: Type.String({ description: "The task for the agent to perform" }),
@@ -34,6 +40,7 @@ export const agentParams = (types: Map<string, AgentDefinition>) => Type.Object(
     run_in_background: Type.Optional(Type.Boolean({ description: "Return at once; a completion notice arrives when the agent exits." })),
     isolation: Type.Optional(Type.Unsafe<"worktree">({ type: "string", enum: ["worktree"], description: "Run the agent in its own git worktree." })),
     readonly: Type.Optional(Type.Boolean({ description: "Run the agent without the edit and write tools." })),
+    ...(batch && { batch: Type.Optional(batchParam) }),
   },
   { additionalProperties: false },
 );

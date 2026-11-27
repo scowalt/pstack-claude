@@ -6,11 +6,12 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
-import { noticeOf, OUTPUT_CAP_BYTES, statusText, truncateUtf8 } from "./agent-text.ts";
+import { noticeOf, statusText } from "./agent-text.ts";
 import type { AgentParams } from "./agent-tools.ts";
 import { type Activity, type AgentChild, alive, type ChildExit, type Fate, PiChild, terminateGroup } from "./child.ts";
 import { HcChild, pidOfTerminal } from "./hc-child.ts";
 import { t3Brief, T3_ENV_REMOVED, T3Child, t3Host, t3Session, type T3Task } from "./t3-child.ts";
+import { OUTPUT_CAP_BYTES, truncateUtf8 } from "./text-cap.mjs";
 import { loadAgentTypes } from "./agent-files.ts";
 import { checkEffort, DEPTH_FLAG, GENERAL_PURPOSE, InvalidValueError, PSTACK_STATE_DIR, readSheet, resolveModel, type Settings } from "./config.ts";
 import { ensureWorktree, planWorktree, settleWorktree, type Worktree, worktreeSchema } from "./worktree.ts";

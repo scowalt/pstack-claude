@@ -6,17 +6,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { AgentRecord, EndedRecord } from "./agents.ts";
 import type { Activity } from "./child.ts";
+import { OUTPUT_CAP_BYTES } from "./text-cap.mjs";
 
 const NOTICE_TYPE = "pstack-agent";
-export const OUTPUT_CAP_BYTES = 50 * 1024;
-
-export function truncateUtf8(text: string, cap: number): string {
-  const buf = Buffer.from(text, "utf8");
-  if (buf.length <= cap) return text;
-  let end = cap;
-  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
-  return buf.subarray(0, end).toString("utf8");
-}
 
 function header({ agent, ...record }: EndedRecord, transcript: string | undefined): string {
   const lines = [`agentId: ${agent.id}`, `description: ${agent.description}`, `status: ${record.status}`, `exit code: ${record.exitCode}`];

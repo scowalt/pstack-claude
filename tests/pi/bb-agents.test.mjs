@@ -150,6 +150,37 @@ describe("batch", () => {
     return { ...made, ids };
   }
 
+  test("a batch can span bb projects: an agent given another project starts on a fresh worktree of that project's default branch, and the parent still wakes once", async () => {
+    const made = setup({ threads: { thr_self: { status: "active" } } });
+    const projects = ["proj_other", "proj_p", undefined];
+    await Promise.all(
+      projects.map((project, i) =>
+        made.pi.call("agent", { description: `worker ${i + 1}`, prompt: "go", run_in_background: true, batch: true, ...(project && { project }) }, made.ctx),
+      ),
+    );
+    await made.pi.emit("turn_end", {}, made.ctx);
+
+    const spawnOf = (title) => callsOf("spawn").find((c) => flag(c.argv, "--title") === title).argv;
+    const elsewhere = spawnOf("worker 1");
+    expect(flag(elsewhere, "--project")).toBe("proj_other");
+    expect(flag(elsewhere, "--new-environment")).toBe("worktree");
+    // That project's default branch, not this thread's HEAD, which is a commit of another repository.
+    expect(elsewhere).not.toContain("--base-branch");
+    expect(elsewhere).not.toContain("--environment");
+    for (const title of ["worker 2", "worker 3"]) {
+      expect(flag(spawnOf(title), "--project")).toBe("proj_p");
+      expect(flag(spawnOf(title), "--environment")).toBe("env_e");
+    }
+    expect(callsOf("spawn").map((c) => flag(c.argv, "--parent-notifications"))).toEqual(["stuck", "stuck", "stuck"]);
+
+    for (const id of ["thr_child1", "thr_child2", "thr_child3"]) finish(id);
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(wakes()).toHaveLength(1);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 3 agents");
+    await waitFor(batchOver);
+  });
+
   test("batched agents start on bb's stuck notifications, and the parent wakes once, when the last finishes, with every result", async () => {
     const { ids } = await fanOut(3);
     expect(ids).toEqual(["thr_child1", "thr_child2", "thr_child3"]);

@@ -111,13 +111,18 @@ export class BbAgents {
 
     const background = params.run_in_background === true;
     if (params.batch && !background) throw new Error("batch needs run_in_background: a foreground agent's result is already its own report.");
-    const args = ["thread", "spawn", "--project", this.env.projectId, "--parent-self", "--title", params.description, "--prompt-file", "-", "--provider", "pi"];
+    const project = typeof params.project === "string" && params.project ? params.project : this.env.projectId;
+    const args = ["thread", "spawn", "--project", project, "--parent-self", "--title", params.description, "--prompt-file", "-", "--provider", "pi"];
     // A foreground call returns the result itself, so bb's report would arrive twice.
     // A batch member's finished turn reports through its batch instead.
     args.push("--parent-notifications", params.batch ? "stuck" : background ? "auto" : "off");
     if (model) args.push("--model", model);
     if (level) args.push("--reasoning-level", level);
-    if (params.isolation === "worktree") {
+    if (project !== this.env.projectId) {
+      // This thread's checkout and HEAD belong to another repository, so bb starts
+      // the worktree from that project's default branch.
+      args.push("--new-environment", "worktree");
+    } else if (params.isolation === "worktree") {
       args.push("--new-environment", "worktree");
       const head = headOf(ctx.cwd);
       if (head) args.push("--base-branch", head);
@@ -239,9 +244,9 @@ export function registerBbAgentTools(pi: ExtensionAPI, agents: BbAgents, setting
     label: "Agent",
     exposure: "model-only",
     description:
-      "Launch a subagent as a bb child thread of this thread, visible in the bb app. Foreground (default) waits and returns its final reply; run_in_background returns its thread id at once, and bb reports to this thread when it finishes. Pass batch: true on each background agent of a fan-out to get one report when the last finishes, not one per agent. Use send_message to steer a running agent or continue a finished one, stop_agent to stop one, list_agents to see them.",
+      "Launch a subagent as a bb child thread of this thread, visible in the bb app. Foreground (default) waits and returns its final reply; run_in_background returns its thread id at once, and bb reports to this thread when it finishes. Pass batch: true on each background agent of a fan-out to get one report when the last finishes, not one per agent. Pass project to start the agent on a fresh worktree of another bb project. Use send_message to steer a running agent or continue a finished one, stop_agent to stop one, list_agents to see them.",
     promptSnippet: "Launch a subagent as a bb child thread (foreground or background, optional worktree)",
-    parameters: agentParams(loadAgentTypes(settings), { batch: true }),
+    parameters: agentParams(loadAgentTypes(settings), { batch: true, project: true }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const id = await agents.start(params, ctx);
       if (params.run_in_background) {

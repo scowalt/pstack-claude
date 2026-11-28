@@ -16,7 +16,13 @@ const batchParam = Type.Boolean({
     "With run_in_background: report this agent together with every other agent this response starts with batch: true. bb wakes this thread once, when the last of them finishes, with all of their results. An agent that fails, or stops on an approval or a question, still wakes it at once.",
 });
 
-export const agentParams = (types: Map<string, AgentDefinition>, { batch = false } = {}) => Type.Object(
+// project exists only inside bb, where a child thread can live in another bb project.
+const projectParam = Type.String({
+  description:
+    "A bb project id (proj_...) other than this thread's. The agent starts on a fresh worktree of that project's default branch, so workers in other repositories stay this thread's agents and can batch.",
+});
+
+export const agentParams = (types: Map<string, AgentDefinition>, { batch = false, project = false } = {}) => Type.Object(
   {
     description: Type.String({ description: "A short (3-5 word) description of the task" }),
     prompt: Type.String({ description: "The task for the agent to perform" }),
@@ -41,6 +47,7 @@ export const agentParams = (types: Map<string, AgentDefinition>, { batch = false
     isolation: Type.Optional(Type.Unsafe<"worktree">({ type: "string", enum: ["worktree"], description: "Run the agent in its own git worktree." })),
     readonly: Type.Optional(Type.Boolean({ description: "Run the agent without the edit and write tools." })),
     ...(batch && { batch: Type.Optional(batchParam) }),
+    ...(project && { project: Type.Optional(projectParam) }),
   },
   { additionalProperties: false },
 );

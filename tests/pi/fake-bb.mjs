@@ -3,9 +3,10 @@
 // logs each call's argv and stdin to FAKE_BB_LOG and answers from the JSON
 // state in FAKE_BB_STATE: { threads: { <id>: { title, status, parentThreadId,
 // output, parentNotifications } }, waitExit, spawnStatus, queued, failing,
-// failFor, wakes }. A spawn adds a thread with the next id, a tell with
+// failFor, failTo, wakes }. A spawn adds a thread with the next id, a tell with
 // --send-at adds a queued message to that thread's queue, and a command whose
-// subcommand is `failing`, or any command a process in failFor runs, fails as
+// subcommand is `failing`, a `<sub> <threadId>` failTo lists as { sub: [ids] },
+// or any command a process in failFor runs, fails as
 // bb does with --json. As bb's scheduler would, each call first sends every
 // queued message whose time has passed.
 //
@@ -57,7 +58,7 @@ const wake = (threadId, kind, extra) => state.wakes.push({ threadId, kind, ...ex
 const queuedText = (m) => m.content[0].text;
 
 if (command !== "thread") process.exit(3);
-if (state.failing === sub || state.failFor?.includes(process.ppid)) {
+if (state.failing === sub || state.failFor?.includes(process.ppid) || state.failTo?.[sub]?.includes(rest[0])) {
   print({ ok: false, error: { message: `fake ${sub} failure`, hint: "try again" } });
   process.exit(1);
 }
@@ -132,6 +133,9 @@ switch (sub) {
     const sendAt = opt("--send-at");
     if (!sendAt) {
       wake(rest[0], "tell", { text: stdin });
+      // bb starts an idle child's next turn at once.
+      const target = state.threads[rest[0]];
+      if (target?.parentThreadId && (target.status ?? "idle") === "idle") target.status = "pending";
       save();
       print({ ok: true, delivery: "sent" });
       break;

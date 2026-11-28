@@ -1,4 +1,4 @@
-// A batch: the background agents one response starts with batch: true. Each
+// A batch: the background agents one response starts or messages with batch: true. Each
 // starts on bb's stuck parent notifications, so a failure or a question still
 // wakes the parent at once and a finished turn does not. The parent's wake for
 // the batch is one message bb holds in the parent's queue, scheduled a few
@@ -20,7 +20,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BbCli, RUNNING, TRACKER_CALL_TIMEOUT_MS, resultText } from "./bb-cli.mjs";
@@ -97,15 +97,27 @@ export class Batches {
   // Starts an agent as a member of this response's batch. The held message
   // and its tracker exist before the agent does, so no member is ever without
   // its report. An agent the batch failed to record reports on its own instead.
-  async join(start) {
+  // An agent that already exists (known) is recorded before start switches it
+  // to stuck, so an older batch's tracker sees it in this one and leaves it be.
+  async join(start, known) {
     this.current ??= this.open().catch((e) => {
       this.current = undefined;
       throw e;
     });
     const path = await this.current;
+    if (known !== undefined) {
+      await this.update(path, (record) => record.members.includes(known) || record.members.push(known));
+      try {
+        await start();
+      } catch (e) {
+        await this.update(path, (record) => (record.members = record.members.filter((m) => m !== known))).catch(() => {});
+        throw e;
+      }
+      return known;
+    }
     const id = await start();
     try {
-      await this.update(path, (record) => record.members.push(id));
+      await this.update(path, (record) => record.members.includes(id) || record.members.push(id));
     } catch (e) {
       await this.bb.json(["thread", "update", id, "--parent-notifications", "auto"]).catch(() => {
         throw new Error(`Started ${id}, but neither recorded it in its batch nor switched it to report on its own: ${e instanceof Error ? e.message : e}`);
@@ -137,6 +149,24 @@ export class Batches {
     });
     this.writes = write.catch(() => {});
     return write;
+  }
+
+  // An earlier batch of this thread that holds the agent and has not reported
+  // yet. Its report carries the agent's next reply too.
+  async pendingBatchOf(id) {
+    const current = await this.current?.catch(() => undefined);
+    if (!existsSync(this.dir)) return undefined;
+    for (const name of readdirSync(this.dir).filter((n) => n.endsWith(".json"))) {
+      const path = join(this.dir, name);
+      if (path === current) continue;
+      try {
+        const record = readJson(path);
+        if (record.members.includes(id) && !(await delivered(this.bb, record))) return path;
+      } catch {
+        // Its tracker closed the batch and removed the record meanwhile.
+      }
+    }
+    return undefined;
   }
 
   // The response's tool calls are done, so its batch has every member it will get.
@@ -230,14 +260,30 @@ async function report(bb, members, done, stopped) {
   const count = done.filter(Boolean).length;
   const head =
     count === members.length
-      ? `[pstack batch] All ${members.length} agents this thread started together in one response have finished. bb held each one's own report until the last finished, so here are all of them.`
-      : `[pstack batch] ${count} of the ${members.length} agents this thread started together in one response have finished. The batch stopped waiting for the rest ${stopped}, so here is where each one stands. The others report to you one by one as they finish.`;
+      ? `[pstack batch] All ${members.length} agents this thread started or messaged together in one response have finished. bb held each one's own report until the last finished, so here are all of them.`
+      : `[pstack batch] ${count} of the ${members.length} agents this thread started or messaged together in one response have finished. The batch stopped waiting for the rest ${stopped}, so here is where each one stands. The others report to you one by one as they finish.`;
   return `${head}\n\n${parts.join("\n\n---\n\n")}\n\n${FROM_PSTACK}`;
 }
 
+// Agents a batch opened after this one holds. That batch put them on stuck and reports for them.
+function claimedLater(path) {
+  const { opened } = readJson(path);
+  const ids = new Set();
+  for (const name of readdirSync(dirname(path)).filter((n) => n.endsWith(".json"))) {
+    try {
+      const other = readJson(join(dirname(path), name));
+      if (other.opened > opened) for (const id of other.members) ids.add(id);
+    } catch {
+      // Its tracker closed the batch and removed the record meanwhile.
+    }
+  }
+  return ids;
+}
+
 // Hands every agent of the batch back to bb's usual notices. True once all are.
-async function handBack(bb, members) {
-  const stuck = members.filter((m) => m.status !== "deleted" && m.parentNotifications !== "auto");
+async function handBack(bb, members, path) {
+  const later = claimedLater(path);
+  const stuck = members.filter((m) => m.status !== "deleted" && m.parentNotifications !== "auto" && !later.has(m.id));
   const results = await Promise.allSettled(stuck.map((m) => bb.json(["thread", "update", m.id, "--parent-notifications", "auto"])));
   return results.every((r) => r.status === "fulfilled");
 }
@@ -255,7 +301,7 @@ async function step(bb, path, look) {
   if (sealed) record = readJson(path);
   const children = await bb.json(["thread", "list", "--parent-thread", parent, "--include-hidden"]);
   const members = record.members.map((id) => children.find((c) => c.id === id) ?? { id, title: null, status: "deleted" });
-  if (look.over) return (await handBack(bb, members)) && sealed;
+  if (look.over) return (await handBack(bb, members, path)) && sealed;
 
   if (sealed) {
     // The parent's run ended before it recorded an agent, so there is nothing to report.
@@ -281,7 +327,7 @@ async function step(bb, path, look) {
     look.allDone = all;
     if (ready) {
       // Handed back before the report goes, so an agent that finishes in between reports on its own rather than not at all.
-      await handBack(bb, members);
+      await handBack(bb, members, path);
       try {
         await bb.json(["thread", "queue", "update", parent, row, "--message-file", "-"], await report(bb, members, done, stopped));
         await bb.json(["thread", "queue", "send", parent, row, "--mode", "auto"]);

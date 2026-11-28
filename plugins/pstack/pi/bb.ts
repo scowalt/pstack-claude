@@ -25,6 +25,7 @@ interface BbThread {
   title: string | null;
   status: string;
   parentThreadId: string | null;
+  parentNotifications?: string;
 }
 
 // A worktree agent starts from the commit the parent has checked out, as a
@@ -171,12 +172,23 @@ export class BbAgents {
   // A batch member's turn reports through its batch, as a batched agent's first turn does.
   async send(to: string, message: string, batch = false): Promise<{ id: string; running: boolean }> {
     const thread = await this.find(to);
+    const setting = batch ? "stuck" : "auto";
     const tell = async () => {
-      await this.cli.json(["thread", "update", thread.id, "--parent-notifications", batch ? "stuck" : "auto"]);
-      await this.cli.json(["thread", "tell", thread.id, "--mode", "auto", "--message-file", "-"], message);
+      await this.cli.json(["thread", "update", thread.id, "--parent-notifications", setting]);
+      try {
+        await this.cli.json(["thread", "tell", thread.id, "--mode", "auto", "--message-file", "-"], message);
+      } catch (e) {
+        // A batched message that never went out must not leave the agent silent outside any batch.
+        const before = thread.parentNotifications ?? "auto";
+        if (batch && before !== setting) await this.cli.json(["thread", "update", thread.id, "--parent-notifications", before]).catch(() => {});
+        throw e;
+      }
       return thread.id;
     };
-    await (batch ? this.batches.join(tell) : tell());
+    // An agent an earlier batch still holds stays in it: that batch's one report carries this reply too.
+    if (!batch) await tell();
+    else if (await this.batches.pendingBatchOf(thread.id)) await tell();
+    else await this.batches.join(tell, thread.id);
     return { id: thread.id, running: RUNNING.has(thread.status) };
   }
 

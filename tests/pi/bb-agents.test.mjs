@@ -605,6 +605,56 @@ describe("batch", () => {
     await waitFor(batchOver);
   });
 
+  test("a batched message bb fails to deliver leaves the agent on the notices it had, outside the batch", async () => {
+    const { pi, ctx } = setup({ threads: { thr_self: { status: "active" }, thr_a: { title: "a", status: "active", parentThreadId: "thr_self", parentNotifications: "auto" } } });
+    bbDoes("__state", JSON.stringify({ failTo: { tell: ["thr_a"] } }));
+    const err = await pi.call("send_message", { to: "thr_a", message: "recount", batch: true }, ctx).catch((e) => e);
+    expect(err.message).toContain("fake tell failure");
+    expect(state().threads.thr_a.parentNotifications).toBe("auto");
+    await pi.emit("turn_end", {}, ctx);
+    await waitFor(batchOver);
+    finish("thr_a");
+    expect(kinds()).toEqual(["child-completed"]);
+  });
+
+  test("a follow-up batch sent while the last batch's tracker is still handing agents back keeps them on stuck", async () => {
+    const { pi, ctx } = await fanOut(3);
+    // The old tracker keeps looking for as long as it cannot hand thr_child3 back.
+    bbDoes("__state", JSON.stringify({ failTo: { update: ["thr_child3"] } }));
+    for (const id of ["thr_child1", "thr_child2", "thr_child3"]) finish(id);
+    await waitFor(() => wakes().length > 0);
+    expect(kinds()).toEqual(["queued"]);
+
+    await pi.emit("agent_start", {}, ctx);
+    for (const to of ["thr_child1", "thr_child2"]) await pi.call("send_message", { to, message: "follow up", batch: true }, ctx);
+    await pi.emit("turn_end", {}, ctx);
+    await sleep(300);
+    expect(["thr_child1", "thr_child2"].map((id) => state().threads[id].parentNotifications)).toEqual(["stuck", "stuck"]);
+
+    for (const id of ["thr_child1", "thr_child2"]) finish(id, { output: `${id} again` });
+    await waitFor(() => wakes().length > 1);
+    await sleep(300);
+    expect(kinds()).toEqual(["queued", "queued"]);
+    expect(wakes()[1].text).toStartWith("[pstack batch] All 2 agents");
+    bbDoes("__state", JSON.stringify({ failTo: {} }));
+    await waitFor(batchOver);
+  });
+
+  test("a batched message to an agent an earlier batch still holds stays in that batch, so the parent wakes once", async () => {
+    const { pi, ctx } = await fanOut(2);
+    await pi.emit("agent_start", {}, ctx);
+    for (const to of ["thr_child1", "thr_child2"]) await pi.call("send_message", { to, message: "also check this", batch: true }, ctx);
+    await pi.emit("turn_end", {}, ctx);
+    expect(readdirSync(batchDir()).filter((n) => n.endsWith(".json"))).toHaveLength(1);
+
+    for (const id of ["thr_child1", "thr_child2"]) finish(id);
+    await waitFor(() => wakes().length > 0);
+    await sleep(300);
+    expect(kinds()).toEqual(["queued"]);
+    expect(wakes()[0].text).toStartWith("[pstack batch] All 2 agents");
+    await waitFor(batchOver);
+  });
+
   test("batch needs run_in_background, and is not offered outside bb", async () => {
     const { pi, ctx } = setup();
     const err = await pi.call("agent", { description: "x", prompt: "x", batch: true }, ctx).catch((e) => e);
